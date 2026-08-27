@@ -1,0 +1,31 @@
+# ===== F1 data files (do not commit — ~50 GB of telemetry) =====
+*.json
+
+# ===== Nested per-season git repositories =====
+2021/.git/
+2022/.git/
+2023/.git/
+2024/.git/
+2025/.git/
+
+# ===== FastF1 caches and generated artifacts =====
+cache/
+cache_joblib/
+fastf1_cache/
+cache_preseason/
+*.sqlite
+*.ff1pkl
+*.log
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# ===== Local planning annotations (stop-n-go phase notes, local-only) =====
+annotations/
+data/
+src/__pycache__/
+notebooks/.ipynb_checkpoints/
+
+graphify-out/
