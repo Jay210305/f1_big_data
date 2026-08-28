@@ -1,0 +1,260 @@
+% ============================================================================
+% Primer avance del proyecto — Curso de Big Data
+% Formato IEEE (conference)
+% ============================================================================
+\documentclass[conference]{IEEEtran}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+
+% ----------------------------------------------------------------------------
+% Metadatos
+% ----------------------------------------------------------------------------
+\newcommand{\tituloProyecto}{Análisis de datos de telemetría de Fórmula 1:
+caracterización y propuesta preliminar de resultados}
+\newcommand{\autores}{[Nombre del estudiante]}
+\newcommand{\institucion}{Universidad [Nombre]\\Facultad de [Ingeniería]}
+
+\begin{document}
+
+\title{\tituloProyecto}
+
+\author{\IEEEauthorblockN{\autores}
+\IEEEauthorblockA{\institucion}}
+
+\markboth{Primer avance del proyecto — Curso de Big Data}{}%
+
+\maketitle
+
+% ----------------------------------------------------------------------------
+% Resumen
+% ----------------------------------------------------------------------------
+\begin{abstract}
+Se presenta el primer avance del proyecto del curso de Big Data, cuyo objetivo
+es el análisis de un repositorio de datos de telemetría pública de Fórmula 1.
+El repositorio seleccionado reúne los conjuntos de datos de TracingInsights
+para las temporadas 2021 a 2025, organizados en archivos JSON de alta
+frecuencia por temporada, Gran Premio, sesión, piloto y vuelta. Se describen
+en detalle la estructura, los tipos de archivo y las variables disponibles,
+así como el volumen aproximado de la información. Finalmente, se plantea una
+propuesta preliminar de resultados y análisis, susceptible de modificarse
+conforme avance el proyecto.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Big Data, Fórmula 1, telemetría, JSON, análisis de datos, TracingInsights.
+\end{IEEEkeywords}
+
+% ----------------------------------------------------------------------------
+% 1. Definición del repositorio seleccionado
+% ----------------------------------------------------------------------------
+\section{Definición del repositorio seleccionado}
+
+El repositorio seleccionado es una colección local de los conjuntos de datos
+públicos de telemetría de Fórmula 1 publicados por \textbf{TracingInsights}
+(\url{https://tracinginsights.com/data/}), correspondientes a las temporadas
+\textbf{2021--2025}. Se trata de un repositorio no oficial, no afiliado a la
+Fórmula 1, a la FIA ni a ningún equipo, distribuido bajo licencia
+\textbf{Apache-2.0}.
+
+El repositorio está organizado de forma jerárquica y autocontenida por
+temporada. Cada carpeta anual (\texttt{2021/}, \texttt{2022/}, \texttt{2023/},
+\texttt{2024/} y \texttt{2025/}) replica la estructura del repositorio GitHub
+de TracingInsights correspondiente a ese año. La información se almacena
+principalmente en archivos \textbf{JSON} y se organiza de acuerdo con la
+siguiente jerarquía:
+
+\begin{itemize}
+  \item \textbf{Temporada} (por ejemplo, \texttt{2024/}).
+  \item \textbf{Evento o Gran Premio} (por ejemplo,
+        \texttt{Bahrain Grand Prix/}).
+  \item \textbf{Sesión} (por ejemplo, \texttt{Race/}, \texttt{Qualifying/},
+        \texttt{Practice 1/}).
+  \item \textbf{Piloto} (por ejemplo, \texttt{VER/}, \texttt{HAM/}).
+  \item \textbf{Vuelta} (por ejemplo, \texttt{1\_tel.json}).
+\end{itemize}
+
+Además de los datos, la colección incluye scripts de extracción y análisis en
+Python, caches de FastF1 y metadatos de Git. Cabe señalar que los directorios
+\texttt{.git/} contienen el historial completo de cada repositorio de temporada
+y dominan la huella en disco, aunque no forman parte del conjunto de datos
+utilizable.
+
+En la Tabla~\ref{tab:resumen} se resume el volumen de información por
+temporada.
+
+\begin{table}[!htbp]
+\centering
+\caption{Resumen de almacenamiento por temporada.}
+\label{tab:resumen}
+\begin{tabular}{@{}cccc@{}}
+\toprule
+\textbf{Año} & \textbf{GPs} & \textbf{Archivos JSON} & \textbf{Tamaño JSON} \\
+\midrule
+2021 & 22 & 62{,}996 & 11.27 GB \\
+2022 & 22 & 62{,}999 & 10.21 GB \\
+2023 & 22 & 62{,}608 & 10.18 GB \\
+2024 & 23 & 70{,}668 & 11.65 GB \\
+2025 & 23 & 106{,}663 & 13.74 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ----------------------------------------------------------------------------
+% 2. Descripción detallada de los datos
+% ----------------------------------------------------------------------------
+\section{Descripción detallada de los datos que se van a analizar}
+
+El conjunto de datos se compone de varios tipos de archivos JSON, cada uno con
+un propósito específico dentro de una sesión de Gran Premio. A continuación se
+describen los más relevantes para el análisis.
+
+\subsection{Telemetría por vuelta (\texttt{\{n\}\_tel.json})}
+
+Se almacena dentro de cada carpeta de piloto y contiene muestras de telemetría
+de alta frecuencia para una única vuelta. Cada archivo agrupa arreglos
+paralelos (una entrada por muestra) con las siguientes variables principales:
+
+\begin{itemize}
+  \item \textbf{time}: tiempo transcurrido en la vuelta (segundos).
+  \item \textbf{speed}: velocidad del monoplaza (km/h).
+  \item \textbf{throttle}: porcentaje de presión del acelerador.
+  \item \textbf{brake}: aplicación del freno.
+  \item \textbf{gear}: marcha seleccionada.
+  \item \textbf{rpm}: revoluciones del motor.
+  \item \textbf{drs}: estado o zona de activación del DRS.
+  \item \textbf{acc\_x}, \textbf{acc\_y}, \textbf{acc\_z}: aceleraciones
+        lateral, longitudinal y vertical (en g).
+  \item \textbf{x}, \textbf{y}, \textbf{z}: coordenadas de posición en pista.
+  \item \textbf{distance} y \textbf{rel\_distance}: distancia dentro de la
+        vuelta (metros) y distancia relativa.
+  \item \textbf{DistanceToDriverAhead}: distancia al monoplaza que precede
+        (metros).
+  \item \textbf{DriverAhead}: código del piloto que precede.
+\end{itemize}
+
+Esta es la fuente de datos más densa del repositorio: una sola sesión de
+carrera de un piloto puede contener más de 50 archivos de telemetría por
+vuelta, y cada archivo miles de muestras de alta frecuencia.
+
+\subsection{Tiempos por vuelta (\texttt{laptimes.json})}
+
+Contiene los tiempos resumidos de toda la sesión para un piloto. Además de la
+lista de tiempos y números de vuelta, incluye:
+
+\begin{itemize}
+  \item \textbf{compound}: compuesto del neumático utilizado (SOFT, MEDIUM,
+        HARD, etc.).
+  \item \textbf{stint}: número de stint (periodo entre paradas en boxes).
+  \item \textbf{s1}, \textbf{s2}, \textbf{s3}: tiempos de los sectores 1, 2 y
+        3.
+  \item Variables adicionales como posición, estado de la vuelta, vida del
+        neumático (\texttt{life}) y bandera de vuelta rápida personal
+        (\texttt{pb}).
+\end{itemize}
+
+\subsection{Tiempos por vuelta de sesión (\texttt{session\_laptimes.json})}
+
+Se almacena en la raíz de la sesión y consolida en un único archivo los arreglos
+de \texttt{laptimes.json} de todos los pilotos, facilitando los análisis
+comparativos a nivel de sesión.
+
+\subsection{Metadatos de pilotos (\texttt{drivers.json})}
+
+Contiene la lista de pilotos participantes con su código, nombre, apellido,
+equipo, número de monoplaza, color del equipo y URL de la imagen oficial.
+
+\subsection{Datos meteorológicos (\texttt{weather.json})}
+
+Contiene muestras de clima en pista, entre ellas la temperatura ambiente
+(\texttt{wAT}), la humedad (\texttt{wH}), la presión (\texttt{wP}), la
+temperatura de pista (\texttt{wTT}), la dirección (\texttt{wWD}) y velocidad
+(\texttt{wWS}) del viento, y un indicador de lluvia (\texttt{wR}).
+
+\subsection{Datos de curvas (\texttt{corners.json})}
+
+Describe la información geométrica de las curvas del circuito: número de
+curva, coordenadas, ángulo, distancia dentro de la vuelta y rotación.
+
+\subsection{Mensajes de dirección de carrera (\texttt{rcm.json})}
+
+Contiene los mensajes emitidos por la dirección de carrera durante la sesión
+(por ejemplo, sanciones o eliminaciones de vuelta por límites de pista).
+
+\subsection{Clasificaciones (\texttt{standings.json}) — solo 2025}
+
+Contiene la clasificación del campeonato de pilotos con posición, puntos,
+victorias, podios, equipo, nacionalidad y diversas métricas de rendimiento.
+Según la documentación del repositorio, este archivo puede estar desactualizado
+(reporta la temporada 2023), por lo que deberá validarse antes de su uso.
+
+En términos globales, el conjunto de datos utilizable está compuesto por
+aproximadamente \textbf{367{,}000 archivos JSON} con un tamaño cercano a
+\textbf{57 GB}, lo que lo convierte en un caso de estudio representativo de un
+volumen de datos de tipo \emph{big data} dentro del dominio del deporte motor.
+
+% ----------------------------------------------------------------------------
+% 3. Propuesta preliminar de resultados
+% ----------------------------------------------------------------------------
+\section{Propuesta preliminar de resultados}
+
+La siguiente propuesta de resultados es preliminar y está sujeta a cambios
+conforme avance el proyecto. En esta primera etapa se plantean los siguientes
+análisis y entregables:
+
+\subsection{Análisis comparativo del rendimiento entre pilotos y equipos}
+Comparar el rendimiento de los pilotos y equipos a partir de las telemetrías y
+los tiempos por vuelta, identificando diferencias en sectores específicos
+(S1, S2, S3) y en variables como velocidad, frenado, aceleración y uso del DRS.
+
+\subsection{Análisis de estrategia de neumáticos y stints}
+Estudiar el impacto del compuesto del neumático y de la longitud de cada stint
+en los tiempos de vuelta, cuantificando la degradación del neumático a lo largo
+de su vida útil.
+
+\subsection{Impacto del clima en el rendimiento}
+Correlacionar las variables meteorológicas (temperatura de pista, humedad,
+velocidad del viento, lluvia) con los tiempos de vuelta y la telemetría, con el
+fin de cuantificar su influencia en el rendimiento.
+
+\subsection{Detección y análisis de adelantamientos}
+Identificar maniobras de adelantamiento mediante la variable
+\texttt{DistanceToDriverAhead} y el código del piloto que precede, y
+caracterizar las zonas del circuito donde ocurren con mayor frecuencia.
+
+\subsection{Evolución del rendimiento entre temporadas (2021--2025)}
+Analizar la evolución del rendimiento a lo largo de las cinco temporadas
+disponibles, comparando tiempos de vuelta, velocidades punta y consistencia
+entre circuitos que se repiten año tras año.
+
+\subsection{Resultados esperados}
+Como resultado preliminar se espera generar reportes estadísticos y
+visualizaciones (gráficas de telemetría, comparativas por sector, mapas de
+degradación de neumáticos y distribuciones de tiempos) que permitan
+caracterizar el rendimiento en Fórmula 1. Los hallazgos y el alcance de estos
+análisis podrán ajustarse en función de la calidad de los datos y de los
+recursos computacionales disponibles.
+
+% ----------------------------------------------------------------------------
+% Referencias
+% ----------------------------------------------------------------------------
+\begin{thebibliography}{1}
+\bibitem{tracinginsights}
+TracingInsights, ``F1 telemetry datasets,'' 2025. [En línea]. Disponible:
+\url{https://tracinginsights.com/data/}.
+\bibitem{fastf1}
+theOehrly, ``FastF1: A python package for accessing and analyzing Formula 1
+results, schedules, timing data and telemetry.'' [En línea]. Disponible:
+\url{https://github.com/theOehrly/FastF1}.
+\bibitem{jolpica}
+Jolpica, ``Jolpica F1 (Ergast) — An open F1 API.'' [En línea]. Disponible:
+\url{https://github.com/jolpica/jolpica-f1}.
+\end{thebibliography}
+
+\end{document}

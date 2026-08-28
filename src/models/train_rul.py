@@ -196,7 +196,7 @@ def train_lstm(seq, feats, epochs, batch_size, device):
                     opt.zero_grad(); loss.backward()
                     nn.utils.clip_grad_norm_(net.parameters(), 5.0)
                     opt.step(); sched.step()
-                losses.append(float(loss) * int(mask.sum().item()))
+                losses.append(float(loss.detach()) * int(mask.sum().item()))
                 n += int(mask.sum().item())
         return sum(losses) / max(n, 1)
 

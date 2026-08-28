@@ -1,12 +1,12 @@
 # ===== F1 data files (do not commit — ~50 GB of telemetry) =====
 *.json
 
-# ===== Nested per-season git repositories =====
-2021/.git/
-2022/.git/
-2023/.git/
-2024/.git/
-2025/.git/
+# ===== Season datasets (TracingInsights clones: JSON + nested .git) =====
+/2021/
+/2022/
+/2023/
+/2024/
+/2025/
 
 # ===== FastF1 caches and generated artifacts =====
 cache/
@@ -31,5 +31,25 @@ notebooks/.ipynb_checkpoints/
 # ===== Python virtual environment =====
 .venv/
 venv/
+
+# ===== Local toolchains / third-party source builds =====
+.tools/
+LightGBM-gpu/
+
+# ===== LaTeX build products (keep source .tex) =====
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.pdf
+
+# ===== OS / IDE =====
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
 
 graphify-out/
