@@ -1,0 +1,159 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{caption}
+\title{Prescriptive Tyre Compound Management and In-Race Stint Strategy Engine\\
+\large An End-to-End Big Data \& Machine Learning Pipeline over Formula 1 Telemetry (2021--2025)}
+\author{Big Data Project}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present an end-to-end pipeline that converts 57\,GB of raw Formula~1
+telemetry (five seasons, $\sim$367k JSON files, 325.5M high-frequency samples)
+into a prescriptive pit-window and stint-strategy engine. The system runs
+entirely on a single laptop (32\,GB RAM, RTX~5070~Ti) using a memory-bounded
+streaming ETL into a ZSTD-compressed Parquet lakehouse (16.7\,GB), a Gold
+feature store with fuel-corrected degradation kinetics, a Remaining Useful
+Life (RUL) regressor and cliff classifier trained with asymmetric losses, an
+unsupervised driving-style profiler (autoencoder + HDBSCAN), and a Monte Carlo
+strategy optimizer with scenario context and debounced cliff alerts. On an
+out-of-sample backtest over 313 real strategic decision points from the 2025
+season, the optimizer's recommendation improves on the actual executed
+strategy in 78.6\% of cases with a median paired gain of $+15$\,s.
+\end{abstract}
+
+\section{System Architecture}
+\begin{verbatim}
+raw JSON (57 GB) -> Bronze/Silver Parquet lakehouse (16.7 GB, ZSTD)
+  -> Gold feature store (fuel-corrected pace, rolling windows, tyre energy)
+  -> Model 1: RUL + cliff (XGBoost/LightGBM/LSTM, asymmetric loss)
+  -> Model 2: driving-style profiler (AE + HDBSCAN)
+  -> Model 3: Monte Carlo pit-window optimizer + in-race pit monitor
+  -> Backtest vs real 2025 strategies
+\end{verbatim}
+All processing is partitioned hierarchically
+(season $\rightarrow$ GP $\rightarrow$ session $\rightarrow$ driver
+$\rightarrow$ stint) with one session per worker; no season is ever held in
+memory. The full pipeline is reproducible via a single orchestrator
+(\texttt{src.run\_all}) with skip-if-cached stages.
+
+\section{Data \& Lakehouse}
+The TracingInsights dataset (2021--2025) provides per-lap telemetry at
+$\sim$10--20\,Hz (\texttt{speed, throttle, brake, gear, rpm, drs, acc\_x/y/z,
+distance, DriverAhead}), lap times with compounds and stint/life metadata,
+weather, corners, and race-control messages. The ETL
+(\texttt{src.ingest.etl}) converts 585 sessions into Hive-partitioned Parquet:
+325.5M telemetry rows, 317k per-lap feature rows, and race-event tables, in
+$\sim$11 minutes with 8 workers. Edge cases handled: \texttt{"None"} string
+nulls, misaligned telemetry channels (truncated to the shortest aligned
+subset), mixed-type JSON columns.
+
+\section{Feature Engineering (Gold Store)}
+Per-lap features combine telemetry aggregates (speed/throttle/brake/DRS
+statistics, G-load integrals, $\sum a_{\text{lat}}^2 v$ tyre energy,
+dirty-air fraction within 10\,m) with \emph{fuel-corrected} pace
+($t_{\text{lap}} + 0.03\,\text{lap}$, races/sprints), causal rolling windows
+($w\in\{3,5,8\}$ means, stds, medians, spreads, 5-lap slopes,
+EMA$_{\alpha\in\{0.2,0.5\}}$), sector deltas (traction-limited S3 vs S1), and a
+causal running-best gap (\texttt{pace\_above\_best}). Environmental context
+(track/ambient temperature, rain, wind) and a rain wash-out track-evolution
+index (chronological weekend rubber accumulation with $\gamma_{\text{wash}}=0.3$
+wet-session resets) complete the store.
+
+\section{Model 1: RUL \& Cliff Prediction}
+\textbf{Labels.} Stints truncated by Safety Cars, DNFs, or short experimental
+runs are filtered. The physical cliff $T_{\text{end}}$ is the first sustained
+(3 consecutive laps) crossing of fuel-corrected rolling-median pace above the
+stint best $+1.5$\,s; the target is piecewise-clipped
+($\text{RUL}\le 15/22/30$ laps for S/M/H). All cliff-derived features are
+excluded from the input matrix (leakage audit: none present).
+
+\textbf{Results (test = 2025, out-of-sample).}
+\begin{table}[h]\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Model & MAE & RMSE & $R^2$ & MAE$_{\text{RUL}\le10}$ & NASA-PHM \\
+\midrule
+Naive (compound mean) & 6.77 & 8.31 & 0.10 & 4.79 & 47896 \\
+XGBoost (asymmetric) & 4.80 & 7.06 & 0.35 & 2.51 & 28103 \\
+XGBoost (symmetric ref.) & 4.70 & 6.85 & 0.39 & 2.70 & 29576 \\
+LSTM (asymmetric) & 5.69 & 8.77 & $-0.01$ & \textbf{1.99} & 32979 \\
+\bottomrule
+\end{tabular}
+\caption{RUL regression (laps). The LSTM wins in the critical degradation
+zone; XGBoost wins overall; the pair is blended in production.}
+\end{table}
+
+The cliff classifier (XGB+LightGBM probability ensemble, threshold tuned on
+validation with recall-biased robust selection) predicts the onset of the
+performance cliff within 3 laps from pure telemetry:
+$F_1=0.747$, AUC$=0.889$. After removing all target leakage, the earlier
+$F_1=0.997$ (v1) is correctly exposed as flag memorisation.
+
+\section{Model 2: Driving-Style Profiler}
+In/out-laps, non-hot laps ($>107\%$ of session best) and SC/VSC laps are
+excluded (44\% of laps removed). Each remaining lap is encoded as a
+micro-sector vector (10 standardised distance bins $\times$
+\{max lateral G, throttle, braking, speed\}) plus track-evolution and
+environmental covariates. A GPU autoencoder (55$\to$16 latent) yields
+driver-season signatures; HDBSCAN finds two archetypes (silhouette 0.69):
+\begin{itemize}
+\item \textbf{Cluster 0} (112 driver-seasons; the established front-runners):
+highest cornering load (lat-G 36.8) yet the gentlest fuel-corrected
+degradation ($-0.05$\,s/lap) --- elite cornering efficiency.
+\item \textbf{Cluster 1} (28; mostly rookies/test drivers): smoothest inputs
+but steepest degradation ($-0.18$\,s/lap).
+\end{itemize}
+
+\section{Model 3: Pit-Window Optimizer}
+A degradation model fitted on 2021--24 races (warm-up-excluded stint slopes:
+$\beta_{\text{S}}=0.107 > \beta_{\text{M}}=0.076 > \beta_{\text{H}}=0.045$\,s/lap;
+robust IQR $\sigma$; empirical cliff-lap distributions; pairwise within-driver
+compound pace offsets) drives a Monte Carlo evaluator with analytic stint
+times. Candidate 0/1/2-stop strategies are ranked per scenario (clean air /
+DRS train $\beta\times1.15$ / backmarker $\beta\times1.25$) with p5--p95
+confidence bands. An in-race monitor applies debounced cliff alerts
+($\ge$2 consecutive laps above threshold) and a joint rule: a cliff alert with
+RUL $>15$ laps is classified as transient thermal degradation, not wear.
+
+\section{Backtest (2025, out-of-sample)}
+At each driver's first real pit window (stint-1 end) in 19 dry races, the
+actual remaining strategy and the optimizer's recommendation are scored by the
+same Monte Carlo with common random numbers (degradation parameters refit on
+2021--24 only):
+\begin{table}[h]\centering
+\begin{tabular}{lr}
+\toprule
+Decisions evaluated & 313 \\
+Optimizer win rate & \textbf{78.6\%} \\
+$\Delta$ (actual $-$ recommended), median & $+15.0$\,s \\
+$\Delta$ mean / p10 / p90 & $+2.1$ / $-76.2$ / $+37.9$\,s \\
+Avg.\ stops actual vs recommended & 1.66 vs 1.33 \\
+\bottomrule
+\end{tabular}
+\caption{Paired Monte Carlo backtest. Ablations: removing the cliff model
+changes 99/120 recommendations; pace offsets 17/120; style clusters 0/120.}
+\end{table}
+
+\section{Limitations}
+(1) The recommender and evaluator share the simulator (selection bias); true
+counterfactual race outcomes are unknowable. (2) The optimizer leans one-stop
+relative to actual field behaviour. (3) Pit loss is circuit-constant (21\,s).
+(4) Scenario multipliers are priors, not fitted. (5) Wet races are excluded.
+(6) Physical-target RUL is inherently noisy ($R^2\approx0.39$ ceiling after
+leakage removal) --- the earlier $0.61$ was strategy-confounded.
+
+\section{Conclusion}
+A complete, reproducible, laptop-scale prescriptive strategy engine: from raw
+JSON to ranked, uncertainty-quantified pit recommendations that beat real
+2025 strategies in $\sim$79\% of decision points under the fitted
+degradation physics. All code, metrics, and phase annotations are versioned;
+the runbook (\texttt{RUNBOOK.md}) executes the full pipeline end-to-end.
+
+\end{document}

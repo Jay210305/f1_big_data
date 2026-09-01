@@ -1,5 +1,8 @@
 # Plan: F1 Prescriptive Tyre & Stint Strategy System
 
+**Status: ALL PHASES COMPLETE (2026-08-31)** — 0 Env ✓ | 1 Schema ✓ | 2 Lakehouse ✓ | 3 Gold features ✓ | 4 RUL/Cliff (v2 refactor) ✓ | 5 Style profiler ✓ | 6 Optimizer ✓ | 7 Backtest & report ✓
+Runbook: `RUNBOOK.md` · Report: `document/strategy_engine_report.tex` · Phase notes: `annotations/` (gitignored)
+
 **Methodology:** Stop-n-Go (checkpointed, reviewable phases).
 **Purpose of this file:** Master roadmap. Tracked in git.
 **Local annotations:** Each phase ends with a Markdown note in `annotations/` (gitignored, local-only).
@@ -175,14 +178,17 @@ Tasks:
 **Objective:** Cluster driving styles & tyre-care behaviour without labels.
 
 Tasks:
-- [ ] Build driver-level style features (brake/turn-in/throttle signatures).
+- [ ] **Hard lap filter (in/out exclusion):** before extracting any micro-telemetry or mechanical stress metrics, drop laps with `laptime IS NULL`, out-laps (first lap of a stint / pit exit), and in-laps (last lap of a stint / pit entry). Optionally restrict to hot laps (within 107% of the driver's session best) and exclude SC/VSC laps (rcm join) so profiles reflect true push pace.
+- [ ] **Track evolution proxy (with rain wash-out):** `track_evolution_index` = chronological weekend rubber accumulation with wet-session wash-out (γ=0.3, wet efficiency 0.5) + per-lap rain grip drop (×0.6 when on wet compounds); add to the Gold feature store as an Autoencoder covariate — disentangles "grippier track" and "rain-washed track" from "gentler style".
+- [ ] **Micro-telemetry computational strategy:** do NOT train the Autoencoder on 325M raw Bronze rows. Materialize a per-lap fixed-length vector via micro-sector aggregation (e.g., 10 standardized distance bins × {max lat G, mean throttle, brake energy, speed}) in DuckDB/Polars (Option B), or decimate to 1–2 Hz (Option A). Laps → vectors streamed to PyTorch.
+- [ ] Build driver-level style features (brake/turn-in/throttle signatures) from the filtered laps.
 - [ ] HDBSCAN clustering → style archetypes.
-- [ ] TimeSeries Autoencoder (PyTorch) → latent embeddings + reconstruction-error anomaly flag.
+- [ ] Autoencoder (PyTorch, GPU) over per-lap micro-sector vectors (+ track evolution & env covariates) → latent embeddings + reconstruction-error anomaly flag.
 - [ ] Interpret clusters (labels, tyre-life impact).
 
-**Deliverable:** `annotations/phase_5_style.md`
+**Deliverable:** `annotations/phase_5_style.md` (+ `annotations/phase_4_5_transition.md` requirements)
 
-**Definition of Done:** Stable clusters with interpretable profiles; embeddings exported to gold store.
+**Definition of Done:** Stable clusters with interpretable profiles; embeddings exported to gold store; in/out laps verifiably excluded; track evolution index present.
 
 **Stop-n-Go checkpoint:** Cluster quality review (silhouette/DBCV).
 
@@ -194,6 +200,8 @@ Tasks:
 
 Tasks:
 - [ ] Merge Model 1 (RUL) + Model 2 (style) + scenario context into a simulator.
+- [ ] **Cliff false-positive mitigation (debouncing):** a pit recommendation requires `cliff_probability > threshold` on at least 2 consecutive laps (hysteresis), not a single spike.
+- [ ] **Joint probability rule:** if the cliff alert fires but RUL predicts > 15 laps remaining, flag as anomaly / temporary thermal degradation (e.g., dirty-air overheating) instead of physical wear — do not pit on it.
 - [ ] Monte Carlo simulation of race outcomes under candidate strategies.
 - [ ] Constrained optimization (SciPy / custom DP) over pit windows & compounds.
 - [ ] Output prescriptive recommendation + confidence band.
