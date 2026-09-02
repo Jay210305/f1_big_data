@@ -160,9 +160,103 @@ ejecutados, los resultados obtenidos y la decisión Go/No-Go/Rework antes
 de habilitar la fase siguiente.
 
 % ============================================================================
-% 2. DATOS Y LAGO DE DATOS (LAKEHOUSE)
+% 2. TRABAJOS RELACIONADOS
 % ============================================================================
-\section{Datos y Lago de Datos}
+\section{Trabajos Relacionados}
+
+\subsection{Optimización de estrategia de pit stops en motorsport}
+
+La optimización de paradas en boxes se ha abordado principalmente con
+programación dinámica y teoría de juegos. Carrasco Heine y
+Thraves~\cite{carrasco2023} formulan la selección de vueltas de parada como
+un problema de programación dinámica sobre datos de tiempos de vuelta
+públicos. Aguad y Thraves~\cite{aguad2024} extienden esa línea a un juego de
+Stackelberg de suma cero entre dos pilotos que compiten, capturando
+interacciones de adelantamiento —una dimensión competitiva que este trabajo
+\textbf{no} modela, ya que el optimizador aquí evalúa un único auto de forma
+aislada. Un enfoque alternativo formula el problema como programación
+cuadrática entera mixta (MIQP), resuelta en tiempo real a partir de la vuelta
+actual~\cite{miqp2024}. Más recientemente, dos trabajos incorporan
+aprendizaje: Neumann~\emph{et al.}~\cite{neumann2025learning} combinan un
+programa no lineal entero mixto con un agente de aprendizaje por refuerzo
+entrenado sobre un modelo de desgaste inspirado en datos de Pirelli, y
+Thomas~\emph{et al.}~\cite{thomas2025rl} desarrollan RL explicable para
+estrategia de carrera en colaboración con un equipo de F1. A diferencia de
+estos trabajos —que operan sobre tiempos de vuelta agregados o simulaciones
+de temporada única—, el presente sistema ancla el modelo de degradación
+directamente en telemetría de alta frecuencia (G-forces, aire sucio, entrada
+térmica) de cinco temporadas completas, y evalúa la recomendación mediante un
+backtest pareado sobre decisiones reales, no solo sobre una simulación
+interna.
+
+\subsection{Modelado de degradación de neumáticos}
+
+Cappello y Hoegh~\cite{cappello2025tire} proponen un modelo bayesiano de
+espacio de estados que estima la degradación latente del neumático a partir
+de tiempos de vuelta públicos de la API de FastF1, usando como caso de
+estudio una sola carrera (Lewis Hamilton, GP de Austria 2025). Su enfoque
+bayesiano produce una cuantificación de incertidumbre más principiada
+(distribución posterior completa) que las bandas empíricas p5–p95 basadas en
+IQR usadas aquí, pero se limita a una carrera y no incorpora telemetría de
+tensión mecánica; en nuestro caso, la falta de significancia estadística
+entre compuestos que ellos reportan se explica, en parte, por el tamaño
+muestral reducido de una sola carrera frente a las $\sim$50\,000 curvas de
+degradación por stint disponibles en el presente lakehouse.
+
+\subsection{Predicción de Vida Útil Remanente (RUL)}
+
+La predicción de RUL proviene principalmente de la literatura de
+Prognostics and Health Management (PHM) industrial. El punto de referencia es
+el conjunto de datos NASA C-MAPSS y la métrica asimétrica introducida por
+Saxena~\emph{et al.}~\cite{saxena2008}, que penaliza exponencialmente las
+predicciones tardías frente a las tempranas —métrica que este trabajo
+reutiliza (Ecuación 2 de la Sección~IV) para evaluar la RUL de neumáticos.
+Hasta donde llega nuestra revisión, esta es la primera aplicación de dicha
+métrica, originalmente diseñada para el desgaste de turbinas de motores de
+avión, al dominio de la degradación de neumáticos en motorsport. La
+comparación de arquitecturas (LSTM vs. XGBoost/LightGBM sobre pérdida
+asimétrica) replica hallazgos consistentes de la literatura de PHM: los
+modelos recurrentes tienden a ganar en la zona crítica de vida corta, mientras
+que los métodos de árboles de gradiente dominan en las métricas agregadas.
+
+\subsection{Perfilado no supervisado de estilo de conducción}
+
+El clustering no supervisado de comportamiento de manejo se ha estudiado
+extensamente en el dominio de vehículos de calle, típicamente con datos de
+conducción naturalista a baja frecuencia y fines de seguridad vial o
+seguros. Wang, Ramesh y Zhao~\cite{wang2018clustering} combinan
+autoencoders con medidas basadas en distancia para agrupar encuentros de
+conducción a partir de trayectorias GPS, un patrón metodológico similar al
+usado aquí (autoencoder + clustering de densidad) pero aplicado a un dominio
+de baja frecuencia y sin la restricción de un circuito cerrado. El
+clustering de densidad HDBSCAN~\cite{campello2013,mcinnes2017} usado en la
+Fase 5 permite, a diferencia de k-means, un número de clusters no fijado a
+priori y una categoría explícita de ruido para conductor-temporadas
+atípicos (pruebas, sustituciones). La literatura de estilo de conducción en
+motorsport de alto rendimiento es comparativamente escasa; este trabajo
+extiende el paradigma de perfilado no supervisado a telemetría de
+competición de 10–20\,Hz con una covariable explícita de evolución de pista.
+
+\subsection{Arquitecturas de datos para telemetría a gran escala}
+
+La arquitectura de tres capas Bronze/Silver/Gold usada aquí sigue el patrón
+de \emph{lakehouse}, formalizado académicamente por
+Armbrust~\emph{et al.}~\cite{armbrust2021}, que argumenta que los formatos
+abiertos (Parquet) con soporte de primera clase para cargas de trabajo de ML
+superan a los almacenes de datos tradicionales para este tipo de análisis.
+DuckDB~\cite{raasveldt2019} habilita la ejecución de agregaciones SQL fuera
+de núcleo directamente sobre los 325.5 millones de filas de Bronze sin un
+clúster distribuido. Esto contrasta con gran parte de la literatura reciente
+de análisis de F1 basada en FastF1, que opera con \texttt{pandas} sobre una
+sola sesión o carrera a la vez —por ejemplo, el trabajo de predicción de
+pit-stops con \emph{deep learning} de~\cite{frontiers2025pitstop} entrena
+sobre telemetría extraída sesión por sesión sin una capa de almacenamiento
+persistente ni particionado jerárquico, lo que dificulta escalar a múltiples
+temporadas. La arquitectura aquí presentada demuestra que ese salto de
+escala (57\,GB, 5 temporadas) es viable en hardware de consumidor sin
+infraestructura distribuida.
+
+
 
 \subsection{Conjunto de datos}
 
@@ -566,7 +660,60 @@ submuestra de 120 decisiones):
 % ============================================================================
 \section{Limitaciones y Trabajo Futuro}
 
-Las limitaciones principales del sistema actual son:
+\subsection{Comparación con el estado del arte}
+
+La tabla~\ref{tab:sota} sitúa este trabajo frente a los estudios más
+cercanos discutidos en la Sección~II, a lo largo de los ejes donde la
+comparación es más informativa.
+
+\begin{table*}[!htbp]
+\centering
+\caption{Comparación cualitativa con trabajos relacionados.}
+\label{tab:sota}
+\small
+\begin{tabular}{@{}p{2.6cm}p{3cm}p{2.6cm}p{2.6cm}p{2.6cm}@{}}
+\toprule
+ & \textbf{Este trabajo} & \textbf{Aguad \& Thraves~\cite{aguad2024}} &
+\textbf{Cappello \& Hoegh~\cite{cappello2025tire}} &
+\textbf{Frontiers~\cite{frontiers2025pitstop}} \\
+\midrule
+Escala de datos & 5 temporadas, 325.5M filas de telemetría & tiempos de vuelta, una temporada & 1 carrera, solo tiempos de vuelta & 1 sesión, telemetría cruda \\
+Modelo de oponentes & No & Sí (juego de Stackelberg) & No & No \\
+Cuantificación de incertidumbre & Monte Carlo empírico (bandas IQR) & determinista / estocástico simple & posterior bayesiana completa & clasificación puntual (sin bandas) \\
+Backtest fuera de muestra & Sí (313 decisiones reales, 2025) & simulación interna & No reportado & hold-out simple \\
+Adaptación en carrera & Reglas de debounce + RUL por vuelta & No & No & clasificación por vuelta \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Del contraste se desprenden limitaciones concretas de este trabajo:
+
+\begin{enumerate}
+  \item \textbf{Ausencia de modelado de oponentes}: a diferencia de
+        Aguad y Thraves~\cite{aguad2024}, el optimizador Monte Carlo evalúa
+        cada estrategia de forma aislada, sin representar el efecto de
+        adelantamientos, tráfico o reacciones estratégicas de otros
+        equipos. Incorporar un componente de juego (aunque sea una
+        heurística de posición relativa) es la limitación más señalada
+        frente a la literatura de teoría de juegos en pit stops.
+  \item \textbf{Cuantificación de incertidumbre menos principiada}: las
+        bandas p5–p95 del simulador Monte Carlo se derivan de dispersión
+        empírica robusta (IQR) y distribuciones empíricas de cliff, no de
+        una posterior bayesiana completa como en~\cite{cappello2025tire}.
+        Esto simplifica el cómputo pero no propaga correctamente la
+        incertidumbre de los propios parámetros ajustados ($\beta$,
+        $\sigma$, offsets de cluster).
+  \item \textbf{Estrategia estática, no reactiva en tiempo real}: a
+        diferencia de los enfoques de aprendizaje por
+        refuerzo~\cite{neumann2025learning,thomas2025rl}, que permiten
+        inferencia rápida y adaptación continua durante la carrera, el
+        optimizador aquí recalcula la estrategia completa por invocación
+        y no aprende una política; el monitor de parada (Fase 6) compensa
+        parcialmente esto con reglas de alerta lap-a-lap.
+\end{enumerate}
+
+Las limitaciones adicionales, ya identificadas internamente durante el
+desarrollo, son:
 
 \begin{enumerate}
   \item \textbf{Sesgo de selección}: el recomendador y el evaluador
@@ -641,14 +788,62 @@ Chen, T. y Guestrin, C., ``XGBoost: A scalable tree boosting system,''
 Ke, G. \textit{et al.}, ``LightGBM: A highly efficient gradient boosting
 decision tree,''
 \textit{Advances in Neural Information Processing Systems}, vol.~30, 2017.
-\bibitem{hdbscan}
-McInnes, L. \textit{et al.}, ``Fast unsupervised density estimation with
-information hierarchy,''
-\textit{Proc. 25th Intl. Conf. on Knowledge Discovery and Data Mining}, 2018.
+\bibitem{campello2013}
+Campello, R. J. G. B., Moulavi, D. y Sander, J., ``Density-based clustering
+based on hierarchical density estimates,''
+\textit{Proc. 17th Pacific-Asia Conf. on Knowledge Discovery and Data
+Mining (PAKDD)}, 2013, pp. 160–172.
+\bibitem{mcinnes2017}
+McInnes, L., Healy, J. y Astels, S., ``hdbscan: Hierarchical density based
+clustering,'' \textit{Journal of Open Source Software}, vol.~2, no.~11,
+p.~205, 2017.
 \bibitem{pytorch}
 Paszke, A. \textit{et al.}, ``PyTorch: An imperative style, high-performance
 deep learning library,''
 \textit{Advances in Neural Information Processing Systems}, vol.~32, 2019.
+\bibitem{aguad2024}
+Aguad, F. y Thraves, C., ``Optimizing pit stop strategies in Formula 1 with
+dynamic programming and game theory,'' \textit{European Journal of
+Operational Research}, vol.~319, no.~3, pp. 908–919, 2024.
+\bibitem{carrasco2023}
+Carrasco Heine, O. F. y Thraves, C., ``On the optimization of pit stop
+strategies via dynamic programming,'' \textit{Central European Journal of
+Operations Research}, vol.~31, no.~1, pp. 239–268, 2023.
+\bibitem{miqp2024}
+``Optimization of pit stop strategies in Formula 1 racing: a data-driven
+approach,'' Repositorio Universidad de Chile, 2024. [En línea]. Disponible:
+\url{https://repositorio.uchile.cl/handle/2250/199664}.
+\bibitem{neumann2025learning}
+Neumann, M.-P. \textit{et al.}, ``Towards learning-based Formula 1 race
+strategies,'' arXiv:2512.21570, 2025.
+\bibitem{thomas2025rl}
+Thomas, D., Jiang, J., Kori, A., Russo, A., Winkler, S., Sale, S.,
+McMillan, J., Belardinelli, F. y Rago, A., ``Explainable reinforcement
+learning for Formula One race strategy,'' \textit{Proc. 40th ACM/SIGAPP
+Symposium on Applied Computing}, 2025, pp. 1090–1097.
+\bibitem{cappello2025tire}
+Cappello, C. y Hoegh, A., ``A state-space approach to modeling tire
+degradation in Formula 1 racing,'' arXiv:2512.00640, 2025.
+\bibitem{saxena2008}
+Saxena, A., Goebel, K., Simon, D. y Eklund, N., ``Damage propagation
+modeling for aircraft engine run-to-failure simulation,'' \textit{Proc.
+2008 Intl. Conf. on Prognostics and Health Management (PHM)}, 2008, pp.
+1–9.
+\bibitem{wang2018clustering}
+Wang, W., Ramesh, A. y Zhao, D., ``Clustering of driving encounter
+scenarios using connected vehicle trajectories,'' arXiv:1807.08415, 2018.
+\bibitem{armbrust2021}
+Armbrust, M., Ghodsi, A., Xin, R. y Zaharia, M., ``Lakehouse: A new
+generation of open platforms that unify data warehousing and advanced
+analytics,'' \textit{Proc. 11th Conf. on Innovative Data Systems Research
+(CIDR)}, 2021.
+\bibitem{raasveldt2019}
+Raasveldt, M. y Mühleisen, H., ``DuckDB: An embeddable analytical
+database,'' \textit{Proc. 2019 Intl. Conf. on Management of Data (SIGMOD)},
+2019, pp. 1981–1984.
+\bibitem{frontiers2025pitstop}
+``Data-driven pit stop decision support for Formula 1 using deep learning
+models,'' \textit{Frontiers in Artificial Intelligence}, 2025.
 \end{thebibliography}
 
 \end{document}
