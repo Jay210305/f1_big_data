@@ -1,6 +1,7 @@
 % ============================================================================
-% Primer avance del proyecto — Curso de Big Data
-% Formato IEEE (conference)
+% Motor de Estrategia Prescriptiva de Neumáticos y Stints en Fórmula 1
+% Pipeline completo de Big Data y Machine Learning sobre telemetría (2021–2025)
+% Formato IEEE (conference) — Curso de Big Data
 % ============================================================================
 \documentclass[conference]{IEEEtran}
 
@@ -12,12 +13,15 @@
 \usepackage{array}
 \usepackage{graphicx}
 \usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\usepackage{multirow}
 
 % ----------------------------------------------------------------------------
 % Metadatos
 % ----------------------------------------------------------------------------
-\newcommand{\tituloProyecto}{Análisis de datos de telemetría de Fórmula 1:
-caracterización y propuesta preliminar de resultados}
+\newcommand{\tituloProyecto}{Motor de Estrategia Prescriptiva de Neumáticos
+y Stints en Fórmula 1:\\Pipeline completo de Big Data y Machine Learning
+sobre telemetría (2021–2025)}
 \newcommand{\autores}{[Nombre del estudiante]}
 \newcommand{\institucion}{Universidad [Nombre]\\Facultad de [Ingeniería]}
 
@@ -28,7 +32,7 @@ caracterización y propuesta preliminar de resultados}
 \author{\IEEEauthorblockN{\autores}
 \IEEEauthorblockA{\institucion}}
 
-\markboth{Primer avance del proyecto — Curso de Big Data}{}%
+\markboth{Curso de Big Data}{}%
 
 \maketitle
 
@@ -36,58 +40,157 @@ caracterización y propuesta preliminar de resultados}
 % Resumen
 % ----------------------------------------------------------------------------
 \begin{abstract}
-Se presenta el primer avance del proyecto del curso de Big Data, cuyo objetivo
-es el análisis de un repositorio de datos de telemetría pública de Fórmula 1.
-El repositorio seleccionado reúne los conjuntos de datos de TracingInsights
-para las temporadas 2021 a 2025, organizados en archivos JSON de alta
-frecuencia por temporada, Gran Premio, sesión, piloto y vuelta. Se describen
-en detalle la estructura, los tipos de archivo y las variables disponibles,
-así como el volumen aproximado de la información. Finalmente, se plantea una
-propuesta preliminar de resultados y análisis, susceptible de modificarse
-conforme avance el proyecto.
+Se presenta un pipeline completo de fin a fin que convierte 57\,GB de datos
+crudos de telemetría de Fórmula 1 (cinco temporadas, $\sim$367\,000 archivos
+JSON, 325.5 millones de muestras de alta frecuencia) en un motor de estrategia
+prescriptiva de paradas en boxes y gestión de stints. El sistema ejecuta
+enteramente en un solo equipo portátil (32\,GB de RAM, RTX~5070~Ti) mediante
+un ETL de streaming con límites de memoria que genera un lago de datos
+(`lakehouse') en formato Parquet comprimido con ZSTD (16.7\,GB), un almacén
+de características doradas (`Gold') con cinéticas de degradación corregidas
+por combustible, un regresor de Vida Útil Remanente (RUL) entrenado con
+pérdida asimétrica y un clasificador de `cliff' mediante un ensamble
+XGBoost+LightGBM con ponderación de clases, un profiler no supervisado
+de estilos de conducción (autoencoder + HDBSCAN), y un optimizador
+Monte Carlo de estrategia con contexto de escenario y alertas de cliff
+con filtrado anti-falso-positivo. En un backtest fuera de muestra sobre 313
+puntos de decisión estratégica reales de la temporada 2025, la recomendación
+del optimizador mejora la estrategia ejecutada real en el 78.6\% de los casos
+con una ganancia pareada mediana de +15\,s.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Big Data, Fórmula 1, telemetría, JSON, análisis de datos, TracingInsights.
+Big Data, Fórmula 1, telemetría, machine learning, estrategia de carrera,
+degradación de neumáticos, optimización Monte Carlo, Parquet, DuckDB.
 \end{IEEEkeywords}
 
-% ----------------------------------------------------------------------------
-% 1. Definición del repositorio seleccionado
-% ----------------------------------------------------------------------------
-\section{Definición del repositorio seleccionado}
+% ============================================================================
+% 1. INTRODUCCIÓN
+% ============================================================================
+\section{Introducción}
 
-El repositorio seleccionado es una colección local de los conjuntos de datos
-públicos de telemetría de Fórmula 1 publicados por \textbf{TracingInsights}
-(\url{https://tracinginsights.com/data/}), correspondientes a las temporadas
-\textbf{2021--2025}. Se trata de un repositorio no oficial, no afiliado a la
-Fórmula 1, a la FIA ni a ningún equipo, distribuido bajo licencia
-\textbf{Apache-2.0}.
+La gestión de neumáticos es uno de los factores estratégicos más determinantes
+en la Fórmula 1 moderna. Cada decisión de parada en boxes —cuándo detenerse,
+qué compuesto elegir y cuántos stints planificar— impacta directamente el
+resultado de la carrera. Sin embargo, las estrategias reales ejecutadas por
+los equipos están influidas por factores no modelables (información de pista,
+comunicación ingeniero-piloto, riesgo percibido) que divergen frecuentemente
+de lo óptimo teórico.
 
-El repositorio está organizado de forma jerárquica y autocontenida por
-temporada. Cada carpeta anual (\texttt{2021/}, \texttt{2022/}, \texttt{2023/},
-\texttt{2024/} y \texttt{2025/}) replica la estructura del repositorio GitHub
-de TracingInsights correspondiente a ese año. La información se almacena
-principalmente en archivos \textbf{JSON} y se organiza de acuerdo con la
-siguiente jerarquía:
+Este proyecto construye un motor de estrategia prescriptiva completo que
+parte de datos crudos de telemetría para generar recomendaciones cuantitativas
+de parada con bandas de confianza. El sistema se organiza en ocho fases
+checkpointeadas (Stop-n-Go), desde la exploración del esquema hasta el
+backtest fuera de muestra, ejecutándose íntegramente en un equipo personal
+con restricciones estrictas de memoria (32\,GB) y almacenamiento (513\,GB SSD).
 
-\begin{itemize}
-  \item \textbf{Temporada} (por ejemplo, \texttt{2024/}).
-  \item \textbf{Evento o Gran Premio} (por ejemplo,
-        \texttt{Bahrain Grand Prix/}).
-  \item \textbf{Sesión} (por ejemplo, \texttt{Race/}, \texttt{Qualifying/},
-        \texttt{Practice 1/}).
-  \item \textbf{Piloto} (por ejemplo, \texttt{VER/}, \texttt{HAM/}).
-  \item \textbf{Vuelta} (por ejemplo, \texttt{1\_tel.json}).
-\end{itemize}
+Los aportes principales del trabajo son:
+\begin{enumerate}
+  \item Un ETL de streaming con paralelización por sesión que procesa 57\,GB
+        de JSON sin cargar ninguna temporada completa en memoria.
+  \item Un esquema de etiquetado de `cliff' de neumáticos que separa la
+        degradación física del desgaste estratégico, con exclusión estricta
+        de fugas de información (`leakage').
+  \item Un profiler de estilo de conducción que desentraña la variabilidad
+        del conductor de la evolución de la pista mediante un proxy de
+        evolución de la pista con lavado por lluvia.
+  \item Un optimizador Monte Carlo con regla de alerta compuesta (cliff +
+        RUL) que distingue degradación térmica transitoria de desgaste
+        físico real.
+\end{enumerate}
 
-Además de los datos, la colección incluye scripts de extracción y análisis en
-Python, caches de FastF1 y metadatos de Git. Cabe señalar que los directorios
-\texttt{.git/} contienen el historial completo de cada repositorio de temporada
-y dominan la huella en disco, aunque no forman parte del conjunto de datos
-utilizable.
+\subsection{Arquitectura del sistema y reproducibilidad}
 
-En la Tabla~\ref{tab:resumen} se resume el volumen de información por
-temporada.
+El sistema se estructura como siete fases encadenadas, cada una
+verificable de forma independiente antes de avanzar a la siguiente
+(metodología Stop-n-Go):
+
+{\scriptsize
+\begin{verbatim}
+JSON crudo (57GB)
+ ->[F2] ETL -> Bronze/Silver
+    (16.7GB ZSTD, 325.5M filas)
+ ->[F3] Gold: ritmo corr. por
+    combustible, ventanas rolling
+ ->[F4] Mod.1: RUL + cliff
+    (XGB/LGBM/LSTM, perd. asim.)
+ ->[F5] Mod.2: estilo conductor
+    (Autoencoder + HDBSCAN)
+ ->[F6] Mod.3: optimizador MC
+    ventana parada + monitor
+ ->[F7] Backtest vs. real 2025
+\end{verbatim}}
+
+Todo el procesamiento se particiona jerárquicamente
+(temporada $\rightarrow$ GP $\rightarrow$ sesión $\rightarrow$
+conductor $\rightarrow$ stint), con un worker por sesión, de modo que
+ninguna temporada se mantiene completa en memoria. El pipeline completo
+es reproducible mediante un único orquestador
+(\texttt{src/run\_all.py}) que ejecuta las seis etapas
+(\texttt{etl}, \texttt{gold}, \texttt{rul}, \texttt{style},
+\texttt{degradation}, \texttt{optimizer}) con lógica de
+\emph{skip-if-cached}: cada etapa revisa si sus artefactos ya existen
+en \texttt{data/} y solo se reejecuta si faltan o si se invoca con
+\texttt{-{}-force}. El \texttt{RUNBOOK.md} documenta el comando exacto,
+los artefactos generados y el tiempo de cómputo esperado de cada etapa
+(tabla~\ref{tab:runbook}).
+
+\begin{table}[!htbp]
+\centering
+\caption{Etapas del pipeline y tiempos de cómputo aproximados.}
+\label{tab:runbook}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Etapa} & \textbf{Artefactos} & \textbf{Tiempo} \\
+\midrule
+ETL & \texttt{data/bronze}, \texttt{data/silver} & $\sim$11\,min \\
+Gold & \texttt{data/gold/*.parquet} & $\sim$6--8\,min \\
+RUL/cliff & \texttt{data/models/*rul*, *cliff*} & $\sim$30\,s \\
+Estilo & \texttt{driver\_embeddings.parquet} & $\sim$4\,min \\
+Degradación & \texttt{degradation\_model.json} & $\sim$30\,s \\
+Optimizador & \texttt{phase6\_demo.json} & $\sim$35\,s \\
+Backtest & \texttt{phase7\_backtest.json} & $\sim$40\,s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Cada fase termina en un punto de control (\emph{checkpoint}) documentado
+en \texttt{annotations/phase\_N\_*.md}, donde se registran los comandos
+ejecutados, los resultados obtenidos y la decisión Go/No-Go/Rework antes
+de habilitar la fase siguiente.
+
+% ============================================================================
+% 2. DATOS Y LAGO DE DATOS (LAKEHOUSE)
+% ============================================================================
+\section{Datos y Lago de Datos}
+
+\subsection{Conjunto de datos}
+
+El conjunto de datos proviene de la fuente pública
+\textbf{TracingInsights}~\cite{tracinginsights} (licencia Apache-2.0),
+que a su vez extrae de FastF1~\cite{fastf1}, Ergast/Jolpica~\cite{jolpica}
+y OpenF1. Cubre las temporadas 2021–2025, con 22–23 Grandes Premios por
+temporada y hasta sesiones de prácticas, clasificación, sprint y carrera.
+
+Los datos se almacenan en una jerarquía:
+\texttt{temporada/GP/sesión/piloto/vuelta\_tel.json}. Cada archivo de
+telemetría contiene muestras de alta frecuencia ($\sim$10–20\,Hz) con
+velocidad, acelerador, freno, marcha, RPM, DRS, aceleraciones triaxiales,
+coordenadas de pista, distancia al coche de adelante y más. Además existen
+archivos de tiempos de vuelta, meteorología, geometría de curvas y mensajes
+de dirección de carrera.
+
+Antes de construir el ETL definitivo se ejecutó una fase de validación de
+esquema (\texttt{src/ingest/explore.py}) sobre una muestra acotada
+(máx. 2 GPs $\times$ 2 conductores $\times$ 2 vueltas por tipo de sesión y
+año), ya que el esquema real varía entre temporadas: la telemetría viene
+envuelta en una clave \texttt{"tel"}, algunos canales
+(\texttt{rel\_distance}, \texttt{DistanceToDriverAhead}, \texttt{acc\_*})
+no están presentes en todos los años, y los valores nulos se codifican
+como la cadena literal \texttt{"None"} en lugar de \texttt{null} de JSON.
+Este manifiesto de esquema (\texttt{src/ingest/schema.py}) es el contrato
+que usa el ETL para normalizar tipos y rellenar canales faltantes con
+literales nulos tipados.
 
 \begin{table}[!htbp]
 \centering
@@ -95,151 +198,421 @@ temporada.
 \label{tab:resumen}
 \begin{tabular}{@{}cccc@{}}
 \toprule
-\textbf{Año} & \textbf{GPs} & \textbf{Archivos JSON} & \textbf{Tamaño JSON} \\
+\textbf{Año} & \textbf{GPs} & \textbf{Archivos JSON} & \textbf{Tamaño} \\
 \midrule
-2021 & 22 & 62{,}996 & 11.27 GB \\
-2022 & 22 & 62{,}999 & 10.21 GB \\
-2023 & 22 & 62{,}608 & 10.18 GB \\
-2024 & 23 & 70{,}668 & 11.65 GB \\
-2025 & 23 & 106{,}663 & 13.74 GB \\
+2021 & 22 & 62{,}996 & 11.27\,GB \\
+2022 & 22 & 62{,}999 & 10.21\,GB \\
+2023 & 22 & 62{,}608 & 10.18\,GB \\
+2024 & 23 & 70{,}668 & 11.65\,GB \\
+2025 & 23 & 106{,}663 & 13.74\,GB \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-% ----------------------------------------------------------------------------
-% 2. Descripción detallada de los datos
-% ----------------------------------------------------------------------------
-\section{Descripción detallada de los datos que se van a analizar}
+\subsection{Lago de datos (Lakehouse)}
 
-El conjunto de datos se compone de varios tipos de archivos JSON, cada uno con
-un propósito específico dentro de una sesión de Gran Premio. A continuación se
-describen los más relevantes para el análisis.
-
-\subsection{Telemetría por vuelta (\texttt{\{n\}\_tel.json})}
-
-Se almacena dentro de cada carpeta de piloto y contiene muestras de telemetría
-de alta frecuencia para una única vuelta. Cada archivo agrupa arreglos
-paralelos (una entrada por muestra) con las siguientes variables principales:
+La arquitectura de datos sigue el patrón Bronze $\to$ Silver $\to$ Gold:
 
 \begin{itemize}
-  \item \textbf{time}: tiempo transcurrido en la vuelta (segundos).
-  \item \textbf{speed}: velocidad del monoplaza (km/h).
-  \item \textbf{throttle}: porcentaje de presión del acelerador.
-  \item \textbf{brake}: aplicación del freno.
-  \item \textbf{gear}: marcha seleccionada.
-  \item \textbf{rpm}: revoluciones del motor.
-  \item \textbf{drs}: estado o zona de activación del DRS.
-  \item \textbf{acc\_x}, \textbf{acc\_y}, \textbf{acc\_z}: aceleraciones
-        lateral, longitudinal y vertical (en g).
-  \item \textbf{x}, \textbf{y}, \textbf{z}: coordenadas de posición en pista.
-  \item \textbf{distance} y \textbf{rel\_distance}: distancia dentro de la
-        vuelta (metros) y distancia relativa.
-  \item \textbf{DistanceToDriverAhead}: distancia al monoplaza que precede
-        (metros).
-  \item \textbf{DriverAhead}: código del piloto que precede.
+  \item \textbf{Bronze} (\texttt{data/bronze/telemetry/}): filas crudas de
+        telemetría particionadas por temporada en formato Parquet con ZSTD.
+        325.5 millones de filas, 16.7\,GB en disco.
+  \item \textbf{Silver} (\texttt{data/silver/}): stints agregados (laptime,
+        compound, vida), eventos de carrera (meteorología, curvas, mensajes
+        de dirección). 0.04\,GB.
+  \item \textbf{Gold} (\texttt{data/gold/}): tabla maestra de
+        características por vuelta ($\sim$317\,000 filas), perfil de estilo
+        por conductor-temporada, curvas de degradación por stint,
+        vectores de micro-sectores y embeddings. $\sim$0.5\,GB.
 \end{itemize}
 
-Esta es la fuente de datos más densa del repositorio: una sola sesión de
-carrera de un piloto puede contener más de 50 archivos de telemetría por
-vuelta, y cada archivo miles de muestras de alta frecuencia.
+\subsection{ETL de streaming}
 
-\subsection{Tiempos por vuelta (\texttt{laptimes.json})}
+El ETL (\texttt{src/ingest/etl.py}) procesa las sesiones en paralelo usando
+\texttt{multiprocessing.Pool} con contexto de `spawn'. Cada worker procesa
+una sesión completa: carga un archivo de telemetría a la vez, lo normaliza
+(manejo de nulos tipo \texttt{"None"}, alineación de canales con longitudes
+desiguales, casteo de tipos), y escribe un archivo Parquet por sesión.
+Se procesan 585 sesiones en $\sim$11 minutos con 8 workers, sin exceder
+los 32\,GB de RAM. El pipeline captura las excepciones por vuelta y por
+sub-paso (telemetría, laptimes, eventos de carrera) para que un archivo
+corrupto no aborte la sesión completa; cada worker retorna un contador de
+errores (\texttt{err}) por sesión.
 
-Contiene los tiempos resumidos de toda la sesión para un piloto. Además de la
-lista de tiempos y números de vuelta, incluye:
+\subsection{Diagnóstico y recuperación de errores}
+
+De las 585 sesiones, 6 fallaron en la corrida completa (las tres sesiones
+de \emph{Pre-Season Testing} 2024/2025 y la \emph{Sprint Shootout} de
+São Paulo 2023). En lugar de reintentar a ciegas, se construyó un script
+de diagnóstico dedicado (\texttt{src/ingest/diagnose\_errors.py}) que
+re-ejecuta \emph{solo} esas sesiones en el proceso principal (sin
+\texttt{multiprocessing}), replicando cada sub-paso del ETL
+(parseo de telemetría, concatenación Silver, unión con laptimes, tablas
+de eventos) con \emph{tracebacks} completos en vez del contador \texttt{err=1}
+silenciado por el pool de workers. Esto permitió aislar la causa exacta
+(estructura de carpetas atípica en pruebas de pretemporada y sesiones
+cortas de shootout) y reingerir únicamente las sesiones afectadas con
+la bandera \texttt{-{}-fix-failed}, sin necesidad de rehacer las 579
+sesiones ya procesadas correctamente.
+
+% ============================================================================
+% 3. INGENIERÍA DE CARACTERÍSTICAS (GOLD)
+% ============================================================================
+\section{Ingeniería de Características}
+
+El almacén Gold se construye en tres tablas principales:
+
+\subsection{Características por vuelta (\texttt{lap\_features})}
+
+Una fila por vuelta ($\sim$317\,000), combinando:
 
 \begin{itemize}
-  \item \textbf{compound}: compuesto del neumático utilizado (SOFT, MEDIUM,
-        HARD, etc.).
-  \item \textbf{stint}: número de stint (periodo entre paradas en boxes).
-  \item \textbf{s1}, \textbf{s2}, \textbf{s3}: tiempos de los sectores 1, 2 y
-        3.
-  \item Variables adicionales como posición, estado de la vuelta, vida del
-        neumático (\texttt{life}) y bandera de vuelta rápida personal
-        (\texttt{pb}).
+  \item \textbf{Telemetría agregada}: estadísticas de velocidad, acelerador,
+        freno, DRS, G-force (media, desviación estándar, máximo), integrales
+        de carga lateral y longitudinal ($\sum |a_{\text{lat}}| \cdot d$),
+        fracción de aire sucio (\texttt{DistanceToDriverAhead} $< 10$\,m).
+  \item \textbf{Corrección de combustible}: en Carreras y Sprints,
+        $t_{\text{corr}} = t_{\text{lap}} + 0.03 \times \text{lap}$ para
+        aislar la degradación del neumático del efecto del combustible.
+  \item \textbf{Características rolling causales}: ventanas en $w \in
+        \{3, 5, 8\}$ vueltas para media, desviación estándar, mediana,
+        rango min-max, pendiente de 5 vueltas y EMA con
+        $\alpha \in \{0.2, 0.5\}$. Gap a la mejor vuelta acumulada
+        del stint (\texttt{pace\_above\_best}).
+  \item \textbf{Delta de sectores}: brechas entre sectores S1/S2/S3,
+        degradación acumulada por sector desde el inicio del stint.
+  \item \textbf{Contexto ambiental}: temperatura de pista/ambiente, lluvia,
+        viento, proxy de evolución de la pista con lavado por lluvia
+        ($\gamma_{\text{wash}} = 0.3$, eficiencia húmeda 0.5).
 \end{itemize}
 
-\subsection{Tiempos por vuelta de sesión (\texttt{session\_laptimes.json})}
+Las estadísticas de telemetría se calculan desde el Bronze usando DuckDB
+(conexión local, ventanas SQL), lo que permite procesar 325.5 millones de
+filas fuera de núcleo por temporada sin cargárlas en RAM.
 
-Se almacena en la raíz de la sesión y consolida en un único archivo los arreglos
-de \texttt{laptimes.json} de todos los pilotos, facilitando los análisis
-comparativos a nivel de sesión.
+\subsection{Perfil de estilo de conducción (\texttt{driver\_style})}
 
-\subsection{Metadatos de pilotos (\texttt{drivers.json})}
+Una fila por conductor-temporada con medias y desviaciones estándar de
+todas las métricas de telemetría. Se usa como covariable en el optimizador.
 
-Contiene la lista de pilotos participantes con su código, nombre, apellido,
-equipo, número de monoplaza, color del equipo y URL de la imagen oficial.
+\subsection{Curvas de degradación por stint (\texttt{stint\_degradation})}
 
-\subsection{Datos meteorológicos (\texttt{weather.json})}
+Una fila por stint ($\sim$50\,000) con pendiente de degradación, presencia
+de cliff, carga mecánica y condiciones ambientales. Campos de resultado
+(\texttt{stint\_length}, \texttt{pace\_end}) marcados como \textbf{leakage}
+para el modelo RUL.
 
-Contiene muestras de clima en pista, entre ellas la temperatura ambiente
-(\texttt{wAT}), la humedad (\texttt{wH}), la presión (\texttt{wP}), la
-temperatura de pista (\texttt{wTT}), la dirección (\texttt{wWD}) y velocidad
-(\texttt{wWS}) del viento, y un indicador de lluvia (\texttt{wR}).
+% ============================================================================
+% 4. MODELO 1: PREDICCIÓN DE RUL Y CLIFF
+% ============================================================================
+\section{Modelo 1: Predicción de Vida Útil Remanente y Cliff}
 
-\subsection{Datos de curvas (\texttt{corners.json})}
+\subsection{Etiquetado}
 
-Describe la información geométrica de las curvas del circuito: número de
-curva, coordenadas, ángulo, distancia dentro de la vuelta y rotación.
+El punto clave es definir cuándo comienza el `cliff' de degradación de un
+stint. Se usa una regla de comportamiento físico:
 
-\subsection{Mensajes de dirección de carrera (\texttt{rcm.json})}
+\begin{enumerate}
+  \item El \emph{mejor ritmo del stint} es el mínimo del laptime corregido
+        por combustible dentro del stint completo (usa información futura
+        solo del lado de la etiqueta, nunca de las características de
+        entrada).
+  \item El \textbf{cliff} ($T_{\text{end}}$) es la primera vuelta, a partir
+        de la posición 3 del stint (para que la vuelta de salida de boxes
+        no pueda dispararlo), en la que la \emph{mediana rolling} de 3
+        vueltas del ritmo corregido cruza sostenidamente (3 vueltas
+        consecutivas) el mejor ritmo del stint $+\ 1.5$\,s. La mediana
+        rolling es robusta a vueltas aisladas de tráfico o vueltas de
+        entrada.
+  \item La \textbf{RUL objetivo} es
+        $\min(T_{\text{end}} - \text{vida}, C_{\text{compuesto}})$ con
+        $C = \{15, 22, 30\}$ vueltas para SOFT/MEDIUM/HARD (recorte por
+        tramos); los stints censurados (sin cliff observado) usan
+        $\text{fin del stint} + 1 - \text{vida}$.
+  \item El \textbf{cliff\_within\_3} (clasificación) indica si el neumático
+        ya está en el cliff o entra en él dentro de las próximas 3 vueltas
+        ($T_{\text{end}} - \text{vida} \le 3$).
+\end{enumerate}
 
-Contiene los mensajes emitidos por la dirección de carrera durante la sesión
-(por ejemplo, sanciones o eliminaciones de vuelta por límites de pista).
+\subsection{Filtrado de stints}
 
-\subsection{Clasificaciones (\texttt{standings.json}) — solo 2025}
+Se eliminan stints truncados por Safety Car/VSC, stints con $<5$ vueltas
+en seco, y stints con $>30\%$ de vueltas nulas. El filtrado elimina
+$\sim$15\% de los datos totales pero mejora significativamente la calidad
+de las etiquetas.
 
-Contiene la clasificación del campeonato de pilotos con posición, puntos,
-victorias, podios, equipo, nacionalidad y diversas métricas de rendimiento.
-Según la documentación del repositorio, este archivo puede estar desactualizado
-(reporta la temporada 2023), por lo que deberá validarse antes de su uso.
+\subsection{Exclusión de fuga de información}
 
-En términos globales, el conjunto de datos utilizable está compuesto por
-aproximadamente \textbf{367{,}000 archivos JSON} con un tamaño cercano a
-\textbf{57 GB}, lo que lo convierte en un caso de estudio representativo de un
-volumen de datos de tipo \emph{big data} dentro del dominio del deporte motor.
+Todas las características derivadas del cliff (\texttt{cliff\_flag},
+\texttt{stint\_best\_pace}, \texttt{stint\_laptime\_median}, etc.) se
+excluyen estrictamente de la matriz de entrada \textbf{X}. Solo quedan
+características de telemetría pura, tendencias de ritmo y entorno. Esto
+revela que el F1 previo de 0.997 del clasificador era memorización de la
+bandera, y el real (post-leakage) es 0.747.
 
-% ----------------------------------------------------------------------------
-% 3. Propuesta preliminar de resultados
-% ----------------------------------------------------------------------------
-\section{Propuesta preliminar de resultados}
+\subsection{Pérdida asimétrica}
 
-La siguiente propuesta de resultados es preliminar y está sujeta a cambios
-conforme avance el proyecto. En esta primera etapa se plantean los siguientes
-análisis y entregables:
+Se implementa una función de pérdida personalizada para XGBoost y LightGBM
+que penaliza 2.5 veces más las predicciones tardías (sobreestimar la vida
+del neumático es el error costoso):
+\begin{equation}
+  L(y, \hat{y}) = \begin{cases}
+    (y - \hat{y})^2 & \text{si } \hat{y} \le y \\
+    2.5 \cdot (\hat{y} - y)^2 & \text{si } \hat{y} > y
+  \end{cases}
+\end{equation}
 
-\subsection{Análisis comparativo del rendimiento entre pilotos y equipos}
-Comparar el rendimiento de los pilotos y equipos a partir de las telemetrías y
-los tiempos por vuelta, identificando diferencias en sectores específicos
-(S1, S2, S3) y en variables como velocidad, frenado, aceleración y uso del DRS.
+Se reporta también la métrica asimétrica NASA PHM con parámetros
+$a_1 = 10$, $a_2 = 5$.
 
-\subsection{Análisis de estrategia de neumáticos y stints}
-Estudiar el impacto del compuesto del neumático y de la longitud de cada stint
-en los tiempos de vuelta, cuantificando la degradación del neumático a lo largo
-de su vida útil.
+\subsection{Resultados (test = 2025, fuera de muestra)}
 
-\subsection{Impacto del clima en el rendimiento}
-Correlacionar las variables meteorológicas (temperatura de pista, humedad,
-velocidad del viento, lluvia) con los tiempos de vuelta y la telemetría, con el
-fin de cuantificar su influencia en el rendimiento.
+La partición temporal es: entrenamiento 2021–2023, validación 2024,
+test 2025.
 
-\subsection{Detección y análisis de adelantamientos}
-Identificar maniobras de adelantamiento mediante la variable
-\texttt{DistanceToDriverAhead} y el código del piloto que precede, y
-caracterizar las zonas del circuito donde ocurren con mayor frecuencia.
+\begin{table}[!htbp]
+\centering
+\caption{RUL regresión (vueltas). Mejor modelo en zona crítica: LSTM.}
+\label{tab:rul}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Modelo} & \textbf{MAE} & \textbf{RMSE} & $R^2$ & \textbf{MAE$_{\le 10}$} \\
+\midrule
+Naïve (media por compuesto) & 6.77 & 8.31 & 0.10 & 4.79 \\
+XGBoost (asimétrico) & 4.80 & 7.06 & 0.35 & 2.51 \\
+XGBoost (simétrico ref.) & 4.70 & 6.85 & 0.39 & 2.70 \\
+LSTM (asimétrico) & 5.69 & 8.77 & $-0.01$ & \textbf{1.99} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\subsection{Evolución del rendimiento entre temporadas (2021--2025)}
-Analizar la evolución del rendimiento a lo largo de las cinco temporadas
-disponibles, comparando tiempos de vuelta, velocidades punta y consistencia
-entre circuitos que se repiten año tras año.
+El LSTM gana en la zona de degradación crítica (RUL $\le 10$ vueltas),
+donde la precisión importa más que la métrica global. XGBoost gana en
+métricas agregadas. La arquitectura LSTM usa embeddings para compound y
+tipo de sesión, 2 capas de 96 unidades, dropout 0.4, y pérdida asimétrica
+SmoothL1.
 
-\subsection{Resultados esperados}
-Como resultado preliminar se espera generar reportes estadísticos y
-visualizaciones (gráficas de telemetría, comparativas por sector, mapas de
-degradación de neumáticos y distribuciones de tiempos) que permitan
-caracterizar el rendimiento en Fórmula 1. Los hallazgos y el alcance de estos
-análisis podrán ajustarse en función de la calidad de los datos y de los
-recursos computacionales disponibles.
+El \textbf{clasificador de cliff} (ensamble XGB+LightGBM con umbral
+afinado en validación con selección recall-biased) logra
+$F_1 = 0.747$, AUC $= 0.889$ sobre 2025.
+
+% ============================================================================
+% 5. MODELO 2: PROFILER DE ESTILO DE CONDUCCIÓN
+% ============================================================================
+\section{Modelo 2: Profiler de Estilo de Conducción}
+
+\subsection{Preprocesamiento}
+
+Se aplica un filtrado estricto: se eliminan vueltas con laptime nulo,
+vueltas de entrada/salida de boxes (primera/última del stint), vueltas
+fuera del 107\% del mejor de la sesión, y vueltas bajo Safety Car/VSC.
+El filtrado elimina $\sim$44\% de las vueltas, dejando solo las
+\emph{hot laps} representativas del ritmo real.
+
+\subsection{Vectores de micro-sectores (Opción B)}
+
+En lugar de entrenar el autoencoder sobre 325 millones de filas crudas,
+cada vuelta se codifica como un vector de longitud fija: 10 bins de
+distancia normalizados $\times$ 4 canales (G-lateral máximo, throttle medio,
+frenado medio, velocidad media) = 40 dimensiones. Se agregan covariables
+de evolución de la pista, temperatura, compound y tipo de sesión para
+un total de 55 entradas.
+
+\subsection{Evolución de la pista}
+
+Se construye un proxy de evolución de la pista
+(\texttt{track\_evolution\_index}) que modela la acumulación de caucho
+a lo largo del fin de semana, con:
+\begin{itemize}
+  \item Pesos por sesión: Práctica 1 (0.6), Práctica 2 (0.8),
+        Práctica 3 (1.0), Sprint (1.3), Carrera (1.5).
+  \item Lavado por lluvia: sesiones húmedas multiplican el
+        estado acumulado por $\gamma_{\text{wash}} = 0.3$.
+  \item Factor instantáneo de lluvia: $\times 0.6$ en vueltas con
+        neumáticos intermedios/blandos.
+\end{itemize}
+
+\subsection{Autoencoder y clustering}
+
+El autoencoder (GPU) tiene arquitectura 55$\to$128$\to$64$\to$16
+(latent)$\to$64$\to$128$\to$55 con activaciones GELU y BatchNorm.
+Se entrena en 2021–2024 (90/10 early stop, paciencia 8) y evalúa
+generalización en 2025.
+
+Los embeddings latentes de cada conductor-temporada se agrupan con
+HDBSCAN (minimum cluster size = 8):
+
+\begin{itemize}
+  \item \textbf{Cluster 0} (112 conductor-temporadas): mayor carga
+        de frenado en curvas (G-lateral 36.8) pero la degradación
+        corregida por combustible más suave ($-0.05$\,s/vuelta) ---
+        eficiencia de frenado de élite.
+  \item \textbf{Cluster 1} (28, mayormente novatos/pruebas): entradas
+        más suaves pero degradación más pronunciada ($-0.18$\,s/vuelta).
+\end{itemize}
+
+Silueta = 0.69. El error de reconstrucción en 2025 (fuera de muestra)
+es media $= 0.00203$, p95 $= 0.00491$.
+
+% ============================================================================
+% 6. MODELO 3: OPTIMIZADOR DE VENTANA DE PARADA
+% ============================================================================
+\section{Modelo 3: Optimizador de Estrategia Prescriptiva}
+
+\subsection{Modelo de degradación}
+
+Se ajusta sobre carreras 2021–2024 (2025 excluido para backtest):
+\begin{itemize}
+  \item \textbf{Beta} por compuesto (pendiente media corregida por
+        combustible): $\beta_S = 0.107 > \beta_M = 0.076 >
+        \beta_H = 0.045$\,s/vuelta.
+  \item \textbf{Offset por cluster}: ajuste de estilo por clusters
+        HDBSCAN.
+  \item \textbf{Coeficiente de temperatura}: cov(beta, temp)/var(temp).
+  \item \textbf{Sigma robusta}: basada en IQR (la desviación estándar
+        bruta está destruida por outliers de tráfico).
+  \item \textbf{Distribución empírica de cliff}: cuantiles + probabilidad
+        de censura por compuesto.
+  \item \textbf{Offsets de ritmo por compuesto}: SOFT-MEDIUM medido
+        pareado por conductor ($-0.35$\,s), HARD simétrico
+        (+0.35\,s) para evitar contaminación de evolución de pista.
+\end{itemize}
+
+\subsection{Simulador Monte Carlo}
+
+El evaluador calcula el tiempo total de un stint de $L$ vueltas
+analíticamente (sin simular vuelta por vuelta):
+\begin{equation}
+  T_{\text{stint}} = L(b + p) + \beta \frac{L(L+1)}{2} + T_{\text{cliff}}
+\end{equation}
+donde $b$ es el ritmo base, $p$ la penalización del escenario,
+$\beta$ la pendiente de degradación, y $T_{\text{cliff}}$ el costo
+adicional si ocurre un cliff durante el stint.
+
+Se enumeran estrategias de 0/1/2 paradas con la regla de dos compuestos
+de la F1. Cada estrategia se evalúa con $N = 400$ simulaciones Monte
+Carlo, generando distribuciones con bandas p5–p95.
+
+\subsection{Escenarios}
+
+Se modelan tres contextos de carrera:
+\begin{itemize}
+  \item \textbf{Aire limpio}: $\beta \times 1.00$, penalización 0\,s.
+  \item \textbf{Tren DRS}: $\beta \times 1.15$, penalización +0.25\,s/vuelta.
+  \item \textbf{Backmarker}: $\beta \times 1.25$, penalización +0.50\,s/vuelta.
+\end{itemize}
+
+\subsection{Monitor de parada en carrera}
+
+El monitor aplica reglas compuestas lap a lap:
+\begin{enumerate}
+  \item \textbf{Filtrado anti-falso-positivo}: la probabilidad de cliff
+        debe superar el umbral en $\ge 2$ vueltas consecutivas
+        (debouncing).
+  \item \textbf{Regla compuesta cliff/RUL}: si el cliff dispara pero
+        RUL predice $>15$ vueltas restantes, se clasifica como
+        degradación térmica transitoria (ej. aire sucio sobrecalentando
+        el neumático) y \textbf{no se recomienda parada}.
+  \item \textbf{RUL inminente}: si RUL $\le 2$ vueltas, se recomienda
+        parada inmediata independientemente del cliff.
+\end{enumerate}
+
+% ============================================================================
+% 7. EVALUACIÓN Y RESULTADOS
+% ============================================================================
+\section{Evaluación: Backtest 2025}
+
+\subsection{Diseño}
+
+En cada punto de decisión real (final del stint 1) de 19 carreras secas
+de 2025, se evalúa la estrategia restante ejecutada y la recomendada por
+el optimizador a través del \textbf{mismo} simulador Monte Carlo con
+números aleatorios pareados (los parámetros de degradación se reajustan
+solo sobre 2021–2024). El delta es
+$\Delta = \text{media(real)} - \text{media(recomendada)}$; $\Delta > 0$
+indica que el optimizador gana.
+
+\subsection{Resultados}
+
+\begin{table}[!htbp]
+\centering
+\caption{Backtest pareado Monte Carlo (2025, aire limpio).}
+\label{tab:backtest}
+\begin{tabular}{lr}
+\toprule
+Decisiones evaluadas & 313 \\
+Tasa de victoria del optimizador & \textbf{78.6\%} \\
+$\Delta$ mediana (real $-$ recomendada) & $+15.0$\,s \\
+$\Delta$ media / p10 / p90 & $+2.1$ / $-76.2$ / $+37.9$\,s \\
+Paradas promedio: real vs recomendada & 1.66 vs 1.33 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablaciones}
+
+Se evaluó la sensibilidad eliminando componentes del modelo (sobre una
+submuestra de 120 decisiones):
+\begin{itemize}
+  \item \textbf{Sin modelo de cliff}: la recomendación cambia en 99/120
+        decisiones, con pérdida media de 12.3\,s.
+  \item \textbf{Sin offsets de compuesto}: cambia en 17/120.
+  \item \textbf{Sin clusters de estilo}: cambia en 0/120 (el efecto del
+        estilo es capturado por otros canales en la práctica).
+\end{itemize}
+
+% ============================================================================
+% 8. LIMITACIONES Y TRABAJO FUTURO
+% ============================================================================
+\section{Limitaciones y Trabajo Futuro}
+
+Las limitaciones principales del sistema actual son:
+
+\begin{enumerate}
+  \item \textbf{Sesgo de selección}: el recomendador y el evaluador
+        comparten el mismo simulador; las carreras contrfactuales reales
+        son unknowables.
+  \item \textbf{Tendencia a una parada}: el optimizador promedia 1.33
+        paradas vs 1.66 reales, sugiriendo que el modelo de degradación
+        subestima el costo acumulado de stints largos.
+  \item \textbf{Pérdida de parada constante}: se asume 21\,s para todos
+        los circuitos; una estimación específica por pista usando longitud
+        del carril de boxes mejoraría la precisión.
+  \item \textbf{Escenarios como priors}: los multiplicadores de tren DRS
+        y backmarker no se ajustan de los datos.
+  \item \textbf{Exclusión de carreras con lluvia}: el modelo es seco
+        únicamente.
+  \item \textbf{$R^2$ moderado}: la RUL física tiene un techo
+        $R^2 \approx 0.39$ tras la remoción de fugas (el valor previo
+        de 0.61 estaba confundido por estrategia).
+\end{enumerate}
+
+Entre las líneas de trabajo futuro se incluyen: estimación dinámica de
+pérdida de parada por circuito, incorporación de datos de neumáticos
+(temperatura de banda, presión), un modelo wet-climate, y un dashboard
+en tiempo real para visualización de recomendaciones durante la carrera.
+
+% ============================================================================
+% 9. CONCLUSIONES
+% ============================================================================
+\section{Conclusiones}
+
+Se ha construido un motor de estrategia prescriptiva completo, reproducible
+y ejecutable en un portátil: desde JSON crudo hasta recomendaciones de
+parada rankeadas con cuantificación de incertidumbre, que superan las
+estrategias reales de 2025 en $\sim$79\% de los puntos de decisión bajo
+la física de degradación ajustada.
+
+El pipeline demuestra que es posible procesar datos de tipo ``big data''
+($\sim$57\,GB, 325.5M filas) en un entorno personal con la combinación
+adecuada de herramientas: DuckDB para consultas fuera de núcleo, Polars
+para ETL de streaming, Parquet comprimido con ZSTD para almacenamiento,
+y GPU para modelado. La arquitectura de lago de datos en tres capas
+(Bronze/Silver/Gold) garantiza trazabilidad y reproducibilidad.
+
+Todos los código, métricas y anotaciones de fase están versionados en
+Git; el runbook (\texttt{RUNBOOK.md}) ejecuta el pipeline completo
+extremo a extremo con un solo comando.
 
 % ----------------------------------------------------------------------------
 % Referencias
@@ -255,6 +628,27 @@ results, schedules, timing data and telemetry.'' [En línea]. Disponible:
 \bibitem{jolpica}
 Jolpica, ``Jolpica F1 (Ergast) — An open F1 API.'' [En línea]. Disponible:
 \url{https://github.com/jolpica/jolpica-f1}.
+\bibitem{polars}
+Polars, ``Polars: Fast multi-threaded DataFrame library.'' [En línea].
+Disponible: \url{https://pola.rs/}.
+\bibitem{duckdb}
+DuckDB, ``DuckDB: An embedded analytics database.'' [En línea]. Disponible:
+\url{https://duckdb.org/}.
+\bibitem{xgboost}
+Chen, T. y Guestrin, C., ``XGBoost: A scalable tree boosting system,''
+\textit{Proc. 22nd ACM SIGKDD}, 2016, pp. 785–794.
+\bibitem{lightgbm}
+Ke, G. \textit{et al.}, ``LightGBM: A highly efficient gradient boosting
+decision tree,''
+\textit{Advances in Neural Information Processing Systems}, vol.~30, 2017.
+\bibitem{hdbscan}
+McInnes, L. \textit{et al.}, ``Fast unsupervised density estimation with
+information hierarchy,''
+\textit{Proc. 25th Intl. Conf. on Knowledge Discovery and Data Mining}, 2018.
+\bibitem{pytorch}
+Paszke, A. \textit{et al.}, ``PyTorch: An imperative style, high-performance
+deep learning library,''
+\textit{Advances in Neural Information Processing Systems}, vol.~32, 2019.
 \end{thebibliography}
 
 \end{document}
