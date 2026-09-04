@@ -51,6 +51,77 @@ RUL_IMMINENT = 2         # RUL <= this => pit now regardless
 # ---------------------------------------------------------------------------
 # Phase 4 model loading + per-lap inference
 # ---------------------------------------------------------------------------
+def load_lstm(meta):
+    lstm_path = MODELS_DIR / "lstm_rul.pt"
+    if not lstm_path.exists():
+        return None
+    try:
+        import torch
+        import torch.nn as nn
+        feats = meta["features"]
+
+        class RULNet(nn.Module):
+            def __init__(self, f, h=96, l=2):
+                super().__init__()
+                self.emb_comp = nn.Embedding(9, 4)
+                self.emb_st = nn.Embedding(4, 2)
+                self.lstm = nn.LSTM(f - 2 + 4 + 2, h, num_layers=l,
+                                    batch_first=True, dropout=0.4)
+                self.drop = nn.Dropout(0.3)
+                self.head = nn.Sequential(nn.Linear(h, 64), nn.ReLU(),
+                                          nn.Dropout(0.3), nn.Linear(64, 1))
+
+            def forward(self, x):
+                comp = x[..., feats.index("compound")].long()
+                st = x[..., feats.index("session_type")].long()
+                rest = [x[..., j] for j in range(x.shape[-1])
+                        if feats[j] not in ("compound", "session_type")]
+                z = torch.cat([self.emb_comp(comp), self.emb_st(st)]
+                              + [r.unsqueeze(-1) for r in rest], dim=-1)
+                out, _ = self.lstm(z)
+                out = self.drop(out)
+                return self.head(out).squeeze(-1)
+
+        net = RULNet(len(feats))
+        state = torch.load(str(lstm_path), map_location="cpu", weights_only=True)
+        net.load_state_dict(state)
+        net.eval()
+        return net
+    except Exception as exc:
+        print(f"[load_phase4] Note: LSTM load bypassed ({exc})")
+        return None
+
+
+def encode_sequence(df: pl.DataFrame, meta) -> np.ndarray:
+    """Encodes a single stint into a normalized (1, L, F) tensor for the LSTM."""
+    feats = meta["features"]
+    codes = meta.get("codes", {})
+    means = meta.get("norm_means", {})
+    stds = meta.get("norm_stds", {})
+    categorical = {"compound", "session_type", "gp", "driver"}
+
+    df = df.sort("life")
+    L = df.height
+    mat = np.zeros((1, L, len(feats)), dtype=np.float32)
+
+    df_enc = df.select(feats).clone()
+    for c in categorical:
+        if c in df_enc.columns and c in codes:
+            df_enc = df_enc.with_columns(
+                pl.col(c).fill_null("UNKNOWN").replace(codes[c]).cast(pl.Int32).alias(c))
+
+    for j, f in enumerate(feats):
+        if f in categorical:
+            mat[0, :, j] = df_enc[f].to_numpy()
+        else:
+            col = df_enc[f].to_numpy().astype(np.float32)
+            col = np.where(np.isfinite(col), col, 0.0)
+            m = means.get(f, 0.0)
+            s = stds.get(f, 1.0) or 1.0
+            mat[0, :, j] = (col - m) / s
+    return mat
+
+
 def load_phase4():
     import xgboost as xgb
     import lightgbm as lgb
@@ -64,7 +135,12 @@ def load_phase4():
     cliff_x.load_model(str(MODELS_DIR / "xgb_cliff.json"))
     cliff_l = lgb.Booster(model_file=str(MODELS_DIR / "lgb_cliff.txt"))
     thr = float(m4["xgb_cliff"]["threshold"])
-    return meta, rul_m, cliff_x, cliff_l, thr
+    # Task 8.H.6: ensemble weights (validation-ROC-AUC proportional); fall
+    # back to 50/50 if an older metrics file predates the weighted ensemble.
+    weights = m4.get("xgb_cliff", {}).get("ensemble_weights",
+                                          {"xgb": 0.5, "lgb": 0.5})
+    lstm_m = load_lstm(meta)
+    return meta, rul_m, cliff_x, cliff_l, thr, weights, lstm_m
 
 
 def encode_frame(df: pl.DataFrame, meta) -> np.ndarray:
@@ -74,11 +150,33 @@ def encode_frame(df: pl.DataFrame, meta) -> np.ndarray:
     return X.to_pandas().to_numpy(dtype=np.float32, na_value=np.nan)
 
 
-def predict_laps(df: pl.DataFrame, meta, rul_m, cliff_x, cliff_l):
+def predict_laps(df: pl.DataFrame, meta, rul_m, cliff_x, cliff_l,
+                 weights=(0.5, 0.5), lstm_m=None):
     import xgboost as xgb
     Xn = encode_frame(df, meta)
-    rul = np.clip(rul_m.predict(xgb.DMatrix(Xn)), 0, None)
-    prob = 0.5 * (cliff_x.predict(xgb.DMatrix(Xn)) + cliff_l.predict(Xn))
+    rul_xgb = np.clip(rul_m.predict(xgb.DMatrix(Xn)), 0, None)
+    if isinstance(weights, dict):
+        w_x, w_l = float(weights.get("xgb", 0.5)), float(weights.get("lgb", 0.5))
+    else:
+        w_x, w_l = float(weights[0]), float(weights[1])
+    prob = w_x * cliff_x.predict(xgb.DMatrix(Xn)) + w_l * cliff_l.predict(Xn)
+
+    # Task 8.0.1 Option B: Piecewise continuous blending with LSTM in critical zone
+    if lstm_m is not None and df.height > 0:
+        import torch
+        seq_mat = encode_sequence(df, meta)
+        with torch.no_grad():
+            rul_lstm = lstm_m(torch.from_numpy(seq_mat)).squeeze(0).numpy()
+        rul_lstm = np.clip(rul_lstm, 0, None)
+        # Smooth continuous transition:
+        # rul_xgb <= 6: full LSTM (w=1.0)
+        # rul_xgb >= 12: full XGBoost (w=0.0)
+        # 6 < rul_xgb < 12: linear blend
+        w = np.clip((12.0 - rul_xgb) / 6.0, 0.0, 1.0)
+        rul = w * rul_lstm + (1.0 - w) * rul_xgb
+    else:
+        rul = rul_xgb
+
     return rul, prob
 
 
@@ -208,14 +306,17 @@ def optimize(state, params, n_sims, scenarios):
 # ---------------------------------------------------------------------------
 # In-race Pit Monitor (transition-spec rules) — backtest on real stints
 # ---------------------------------------------------------------------------
-def run_monitor(df_driver, meta, rul_m, cliff_x, cliff_l, thr, label=""):
+def run_monitor(df_driver, meta, rul_m, cliff_x, cliff_l, thr, label="",
+                weights=(0.5, 0.5), lstm_m=None):
     """Applies debounced cliff + joint RUL rules lap by lap per stint."""
-    print(f"\n[pit-monitor] {label}")
+    blend_desc = "blended XGB+LSTM" if lstm_m is not None else "pure XGB"
+    print(f"\n[pit-monitor] {label} (RUL engine: {blend_desc})")
     df_driver = df_driver.sort(STINT_KEYS + ["life"])
     for (key, grp) in df_driver.group_by(STINT_KEYS, maintain_order=True):
         season, gp, session, driver, stint = key
         grp = grp.sort("life")
-        rul, prob = predict_laps(grp, meta, rul_m, cliff_x, cliff_l)
+        rul, prob = predict_laps(grp, meta, rul_m, cliff_x, cliff_l,
+                                 weights=weights, lstm_m=lstm_m)
         laps = grp["lap"].to_numpy()
         life = grp["life"].to_numpy()
         n = len(laps)
@@ -257,13 +358,14 @@ def get_state(df, season, gp, session, driver, lap, lapf=None):
                     & (pl.col("driver") == driver))
     if sub.height == 0:
         raise SystemExit(f"no data for {season} {gp} {session} {driver}")
-    # race length from the RAW lap table (the filtered labeled frame can drop
-    # short final stints and undercount the race distance)
+    season = str(season)
     if lapf is not None:
+        lapf = lapf.with_columns(pl.col("season").cast(pl.Utf8))
         n_laps = int(lapf.filter((pl.col("season") == season)
                                  & (pl.col("gp") == gp)
                                  & (pl.col("session") == session))["lap"].max())
     else:
+        df = df.with_columns(pl.col("season").cast(pl.Utf8))
         n_laps = int(df.filter((pl.col("season") == season)
                                & (pl.col("gp") == gp)
                                & (pl.col("session") == session))["lap"].max())
@@ -303,7 +405,7 @@ def main():
 
     with open(MODELS_DIR / "degradation_model.json") as fh:
         params = json.load(fh)
-    meta, rul_m, cliff_x, cliff_l, thr = load_phase4()
+    meta, rul_m, cliff_x, cliff_l, thr, weights, lstm_m = load_phase4()
 
     print("[opt] building labeled frame...")
     df = build_labeled_frame()
@@ -326,8 +428,8 @@ def main():
     results = optimize(state, params, args.n_sims, SCENARIOS)
     for sname, rows in results.items():
         print(f"\n[strategy] scenario: {sname} "
-              f"(beta x{SCENARIOS[sname]['beta_mult']}, "
-              f"pace +{SCENARIOS[sname]['pace_pen']}s/lap)")
+          f"(beta x{SCENARIOS[sname]['beta_mult']}, "
+          f"pace +{SCENARIOS[sname]['pace_pen']}s/lap)")
         print(f"  {'strategy':32s} {'stops':>5s} {'mean':>8s} {'std':>6s} "
               f"{'p5':>8s} {'p95':>8s} {'dvs best':>9s}")
         for r in rows[:6]:
@@ -342,7 +444,7 @@ def main():
                        & (pl.col("driver") == args.driver))
     run_monitor(drv_df, meta, rul_m, cliff_x, cliff_l, thr,
                 f"{args.season} {args.gp} Race {args.driver} "
-                f"(threshold {thr:.3f})")
+                f"(threshold {thr:.3f})", weights=weights, lstm_m=lstm_m)
 
     out = {
         "state": {k: v for k, v in state.items()},

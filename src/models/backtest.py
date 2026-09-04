@@ -157,6 +157,8 @@ def main():
                 "gp": race, "driver": key[3],
                 "actual_stops": sum(1 for c, e, cur in actual_strat if not cur),
                 "rec_stops": best["stops"],
+                "stop_match": sum(1 for c, e, cur in actual_strat if not cur)
+                              == best["stops"],
                 "actual_strategy": " | ".join(
                     f"{c}->{e}" for c, e, cur in actual_strat),
                 "rec_strategy": best["strategy"],
@@ -192,6 +194,28 @@ def main():
           f"p10={summary['delta_p10']}  p90={summary['delta_p90']}")
     print(f"  avg stops: actual={summary['mean_actual_stops']}  "
           f"recommended={summary['mean_rec_stops']}")
+
+    # --- Task 8.H.8.1: stratify decisions by stop-count divergence ---
+    print("\n[bt] stratification by stop-count divergence "
+          "(recommended == actual vs different):")
+    strat = {"match": [], "divergent": []}
+    for r in rows:
+        strat["match" if r["stop_match"] else "divergent"].append(r["delta"])
+    for key, ds in strat.items():
+        if not ds:
+            print(f"  {key:10s} : (none)")
+            continue
+        d = np.array(ds)
+        w = int((d > 0).sum())
+        print(f"  {key:10s} : n={len(d)}  win_rate={w/len(d):.1%}  "
+              f"delta_median={np.median(d):+5.1f}s  delta_mean={d.mean():+5.1f}s")
+    summary["stratified_win_rates"] = {
+        k: ({"n": len(np.array(v)), "win_rate": round(float((np.array(v) > 0).mean()), 3),
+             "delta_mean": round(float(np.mean(v)), 1),
+             "delta_median": round(float(np.median(v)), 1)} if v else None)
+        for k, v in strat.items()}
+    summary["n_stop_match"] = len(strat["match"])
+    summary["n_stop_divergent"] = len(strat["divergent"])
 
     # --- ablations on a subsample (how often the recommendation changes) ---
     print("\n[bt] ablations (recommendation sensitivity)...")

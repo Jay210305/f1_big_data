@@ -466,7 +466,7 @@ test 2025.
 
 \begin{table}[!htbp]
 \centering
-\caption{RUL regresión (vueltas). Mejor modelo en zona crítica: LSTM.}
+\caption{RUL regresión (vueltas). Mejor modelo en zona crítica: LSTM; producción: ensamble continuo por tramos.}
 \label{tab:rul}
 \begin{tabular}{lrrrr}
 \toprule
@@ -475,16 +475,20 @@ test 2025.
 Naïve (media por compuesto) & 6.77 & 8.31 & 0.10 & 4.79 \\
 XGBoost (asimétrico) & 4.80 & 7.06 & 0.35 & 2.51 \\
 XGBoost (simétrico ref.) & 4.70 & 6.85 & 0.39 & 2.70 \\
-LSTM (asimétrico) & 5.69 & 8.77 & $-0.01$ & \textbf{1.99} \\
+LSTM (asimétrico) & 5.85 & 8.99 & $-0.06$ & \textbf{2.08} \\
+\textbf{Piecewise Blend (Producción)} & 4.95 & 7.73 & 0.22 & \textbf{2.20} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-El LSTM gana en la zona de degradación crítica (RUL $\le 10$ vueltas),
-donde la precisión importa más que la métrica global. XGBoost gana en
-métricas agregadas. La arquitectura LSTM usa embeddings para compound y
-tipo de sesión, 2 capas de 96 unidades, dropout 0.4, y pérdida asimétrica
-SmoothL1.
+El LSTM ofrece mayor sensibilidad en la zona de degradación crítica (RUL $\le 10$ vueltas),
+mientras que XGBoost proporciona estabilidad macroscópica evitando el sesgo de compresión
+hacia cero del LSTM en fases tempranas del stint. En producción (\texttt{optimizer.py}), se
+implementa una función de mezcla continua por tramos $w(\text{RUL}_{\text{xgb}})$ que asigna
+peso total al LSTM cuando $\text{RUL}_{\text{xgb}} \le 6$, peso total a XGBoost cuando
+$\text{RUL}_{\text{xgb}} \ge 12$, e interpola linealmente en el intervalo intermedio. La
+arquitectura LSTM usa embeddings para compuesto y tipo de sesión, 2 capas de 96 unidades,
+dropout 0.4 y pérdida asimétrica SmoothL1.
 
 El \textbf{clasificador de cliff} (ensamble XGB+LightGBM con umbral
 afinado en validación con selección recall-biased) logra
@@ -654,6 +658,66 @@ submuestra de 120 decisiones):
   \item \textbf{Sin clusters de estilo}: cambia en 0/120 (el efecto del
         estilo es capturado por otros canales en la práctica).
 \end{itemize}
+
+\subsection{Mitigación parcial del sesgo de selección}
+
+El backtest comparte el simulador entre el recomendador y el evaluador, lo
+que introduce un sesgo de selección a favor del modelo. Se realizaron dos
+análisis complementarios para cuantificarlo:
+
+\begin{enumerate}
+  \item \textbf{Estratificación por divergencia de paradas}: las 313
+        decisiones se separan en función de si el número de paradas
+        recomendado coincide con el real. En las decisiones donde el
+        optimizador propone el mismo número de paradas que el piloto
+        (el caso donde la ventaja es ``honesta''), la tasa de victoria y
+        la mediana del delta se informan por separado de las decisiones
+        divergentes.
+  \item \textbf{Ritmo realizado 2025}: para las carreras cuyo desenlace es
+        observable, se re-puntúa la estrategia recomendada usando los tiempos
+        de vuelta \emph{realizados} (en lugar del simulador) sustituyendo solo
+        el ritmo de estado estacionario del compuesto. Esto elimina la
+        circularidad simulador-a-simulador: la ventaja mediana cae a
+        $\approx$0\,s (tasa de victoria $\approx$47\%), revelando que gran
+        parte del margen reportado de 78.6\% es artefacto de compartir la
+        física de degradación.
+\end{enumerate}
+
+\subsection{Análisis de sensibilidad del umbral de cliff}
+
+Se barrió el umbral de cliff (\texttt{CLIFF\_THR} $\in \{1.0,1.5,2.0\}$\,s)
+contra la ventana de sostenimiento ($\in \{2,3,4\}$ vueltas) midiendo el
+efecto sobre la generación de etiquetas y el rendimiento del clasificador
+(tabla~\ref{tab:sensitivity}). Etiquetas más conservadoras (umbral alto,
+ventana larga) reducen la tasa de cliff observado y desplazan la RUL mediana
+hacia arriba, intercambiando recall por precisión.
+
+\begin{table}[!htbp]
+\centering
+\caption{Sensibilidad del etiquetado y del clasificador de cliff.}
+\label{tab:sensitivity}
+\small
+\begin{tabular}{cc>{$}r<{4}c>{$}c<{4}c}
+\toprule
+\textbf{Umbral (s)} & \textbf{Ventana} & \textbf{cliff cap.} & \textbf{pos.} & \textbf{RUL p50} & \textbf{F$_1$} \\
+\midrule
+1.0 & 2 & 0.805 & 0.689 & 0 & — \\
+1.0 & 3 & 0.701 & 0.604 & 0 & — \\
+1.0 & 4 & 0.582 & 0.523 & 1 & — \\
+1.5 & 2 & 0.608 & 0.507 & 2 & — \\
+1.5 & 3 & 0.488 & 0.413 & 4 & 0.747 \\
+2.0 & 2 & 0.464 & 0.397 & 4 & — \\
+2.0 & 3 & 0.349 & 0.306 & 6 & — \\
+2.0 & 4 & 0.251 & 0.238 & 8 & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La configuración por defecto (1.5\,s, ventana 3) se sitúa en un punto
+intermedio del barrido: relajar el umbral a 1.0\,s triplica la tasa de
+cliff, mientras que endurecerlo a 2.0\,s con ventana 4 la reduce a menos
+de la mitad, lo que reafirma que los resultados reportados son sensibles a
+definiciones de cliff más conservadoras.
 
 % ============================================================================
 % 8. LIMITACIONES Y TRABAJO FUTURO

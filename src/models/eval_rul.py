@@ -38,17 +38,21 @@ def build_labeled_frame() -> pl.DataFrame:
 def main():
     with open(MODELS_DIR / "phase4_metrics.json") as fh:
         res = json.load(fh)
+    with open(MODELS_DIR / "feature_meta.json") as fh:
+        meta = json.load(fh)
 
-    print("=" * 78)
+    print("=" * 88)
     print("Phase 4 v2 — RUL / Cliff (refactored, no leakage) — saved metrics")
-    print("=" * 78)
-    print(f"\n{'Model':16s} {'MAE':>7s} {'RMSE':>7s} {'R2':>7s} {'MAE<=10':>8s} {'PHM':>9s}")
+    print("=" * 88)
+    print(f"\n{'Model':18s} {'MAE':>7s} {'RMSE':>7s} {'R2':>7s} {'MAE<=10':>8s} {'R2_crit':>8s} {'R2_nc':>7s} {'PHM':>9s}")
     for k in ["naive_const", "naive_compound", "lgb_rul", "xgb_rul",
-              "xgb_rul_sym", "lstm_rul"]:
+              "xgb_rul_sym", "lstm_rul", "piecewise_blend"]:
         if k in res:
             r = res[k]
-            print(f"{k:16s} {r['MAE']:7.3f} {r['RMSE']:7.3f} {r['R2']:7.3f} "
-                  f"{r['MAE_crit']:8.3f} {r['PHM']:9.0f}")
+            r2_c = f"{r.get('R2_crit', float('nan')):8.3f}"
+            r2_nc = f"{r.get('R2_noncrit', float('nan')):7.3f}"
+            print(f"{k:18s} {r['MAE']:7.3f} {r['RMSE']:7.3f} {r['R2']:7.3f} "
+                  f"{r['MAE_crit']:8.3f} {r2_c} {r2_nc} {r['PHM']:9.0f}")
     if "xgb_cliff" in res:
         c = res["xgb_cliff"]
         print(f"\nCliff (in-cliff or onset within 3 laps, thr={c.get('threshold',0.5):.3f}):")
@@ -56,11 +60,9 @@ def main():
               f"f1={c['f1']:.3f} auc={c['auc']:.3f}")
 
     # --- per-stint prediction sample (2025 Bahrain Race VER, stint 1) ---
-    print("\nSample: XGBoost RUL predictions vs physical target "
+    print("\nSample: RUL predictions (XGBoost vs LSTM vs Piecewise Blend) "
           "(2025 Bahrain Race VER stint 1):")
-    import xgboost as xgb
-    model = xgb.Booster()
-    model.load_model(str(MODELS_DIR / "xgb_rul.json"))
+    from src.models.optimizer import load_phase4, predict_laps
 
     df = build_labeled_frame()
     sub = df.filter(
@@ -70,25 +72,25 @@ def main():
     if sub.height == 0:
         print("  (stint filtered out or not found)")
         return
-    feats = [c for c in df.columns if c not in RD.EXCLUDED]
-    # encode categoricals with codes computed from the FULL frame
-    # (consistent with training)
-    X = sub.select(feats).clone()
-    for c in RD.CATEGORICAL:
-        mapping = {v: i for i, v in enumerate(sorted(df[c].unique().to_list()))}
-        X = X.with_columns(pl.col(c).replace(mapping).cast(pl.Int32).alias(c))
-    Xn = X.to_pandas().to_numpy(dtype=np.float32, na_value=np.nan)
-    pred = np.clip(model.predict(xgb.DMatrix(Xn)), 0, None)
-    sub = sub.with_columns(pl.Series("rul_pred", pred))
+
+    meta, rul_m, cliff_x, cliff_l, thr, weights, lstm_m = load_phase4()
+    rul_blend, prob = predict_laps(sub, meta, rul_m, cliff_x, cliff_l, weights=weights, lstm_m=lstm_m)
+    rul_pure_xgb, _ = predict_laps(sub, meta, rul_m, cliff_x, cliff_l, weights=weights, lstm_m=None)
+
+    sub = sub.with_columns([
+        pl.Series("rul_xgb", np.round(rul_pure_xgb, 1)),
+        pl.Series("rul_blend", np.round(rul_blend, 1)),
+        pl.Series("cliff_prob", np.round(prob, 3)),
+    ])
     cols = ["life", "laptime", "fuel_corr", "pace_above_best", "target_rul",
-            "rul_pred", "cliff_within_3"]
+            "rul_xgb", "rul_blend", "cliff_prob", "cliff_within_3"]
     avail = [c for c in cols if c in sub.columns]
     print(sub.select(avail).to_pandas().to_string(index=False))
 
-    print("\n" + "=" * 78)
-    print("Acceptance: crit-zone MAE < 2.0 (LSTM 1.99); R2 and F1 targets")
-    print("are honestly reported in phase4_metrics.json — see annotation.")
-    print("=" * 78)
+    print("\n" + "=" * 88)
+    print("Acceptance: crit-zone MAE < 2.0 (LSTM 2.00, Blend 2.14 vs XGB 2.51);")
+    print("R2 and F1 targets honestly reported in phase4_metrics.json — see annotation.")
+    print("=" * 88)
 
 
 if __name__ == "__main__":

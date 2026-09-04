@@ -22,7 +22,8 @@ BRONZE = DATA / "bronze" / "telemetry"
 GOLD = DATA / "gold"
 MODELS = DATA / "models"
 
-STAGES = ["etl", "gold", "rul", "style", "degradation", "optimizer"]
+STAGES = ["etl", "verify_schema", "gold", "rul", "style", "degradation",
+          "optimizer"]
 
 
 def _done(path: Path, min_size: int = 1000) -> bool:
@@ -51,6 +52,9 @@ def main():
     plan = {
         "etl": (lambda: _done(BRONZE),
                 [py, "-m", "src.ingest.etl", "--workers", "8"]),
+        "verify_schema": (lambda: _done(ROOT / "data" / "bronze"
+                                        / "phase2_schema_verify.json"),
+                          [py, "-m", "src.ingest.verify_schema"]),
         "gold": (lambda: _done(GOLD / "lap_features.parquet"),
                  [py, "-m", "src.features.build_gold"]),
         "rul": (lambda: _done(MODELS / "phase4_metrics.json"),

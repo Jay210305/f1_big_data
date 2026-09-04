@@ -313,7 +313,7 @@ def make_tabular(df: pl.DataFrame):
         df = df.with_columns(pl.col(c).replace(mapping).cast(pl.Int32).alias(c))
     out = {}
     for split, years in SPLIT.items():
-        sub = df.filter(pl.col("season").is_in(years))
+        sub = df.filter(pl.col("season").is_in(years)).sort(STINT_KEYS + ["life"])
         X = sub.select(feats)
         out[split] = (X, sub["target_rul"].to_numpy().astype(np.float32),
                       sub["cliff_within_3"].to_numpy().astype(np.float32))
@@ -333,7 +333,8 @@ def make_sequences(df: pl.DataFrame, feats: list[str], codes: dict):
     def encode(sub: pl.DataFrame):
         sub = sub.sort(STINT_KEYS + ["life"])
         seqs, ruls, cliffs, sids = [], [], [], []
-        for key, grp in sub.group_by(STINT_KEYS):
+        for key, grp in sub.group_by(STINT_KEYS, maintain_order=True):
+            grp = grp.sort("life")
             mat = np.zeros((grp.height, len(feats)), dtype=np.float32)
             for j, f in enumerate(feats):
                 if f in CATEGORICAL:

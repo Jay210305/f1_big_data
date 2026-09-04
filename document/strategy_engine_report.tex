@@ -83,11 +83,11 @@ Model & MAE & RMSE & $R^2$ & MAE$_{\text{RUL}\le10}$ & NASA-PHM \\
 Naive (compound mean) & 6.77 & 8.31 & 0.10 & 4.79 & 47896 \\
 XGBoost (asymmetric) & 4.80 & 7.06 & 0.35 & 2.51 & 28103 \\
 XGBoost (symmetric ref.) & 4.70 & 6.85 & 0.39 & 2.70 & 29576 \\
-LSTM (asymmetric) & 5.69 & 8.77 & $-0.01$ & \textbf{1.99} & 32979 \\
+LSTM (asymmetric) & 5.85 & 8.99 & $-0.06$ & \textbf{2.08} & 35221 \\
+\textbf{Piecewise Blend (Prod.)} & 4.95 & 7.73 & 0.22 & \textbf{2.20} & 29343 \\
 \bottomrule
 \end{tabular}
-\caption{RUL regression (laps). The LSTM wins in the critical degradation
-zone; XGBoost wins overall; the pair is blended in production.}
+\caption{RUL regression (laps). The LSTM provides end-of-life sensitivity; XGBoost provides macro stability; a continuous piecewise blend $w(\text{RUL}_{\text{xgb}})$ is executed in production (\texttt{optimizer.py}).}
 \end{table}
 
 The cliff classifier (XGB+LightGBM probability ensemble, threshold tuned on

@@ -1,0 +1,5 @@
+# Development / CI dependencies (test runner on top of the runtime stack).
+# torch is intentionally absent (installed separately with CUDA wheels; see
+# requirements.txt). CI runs without a GPU and without the 57 GB dataset.
+-r requirements.txt
+pytest>=8.0

@@ -21,12 +21,21 @@ cache_preseason/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # ===== Local planning annotations (stop-n-go phase notes, local-only) =====
 annotations/
 data/
 src/__pycache__/
 notebooks/.ipynb_checkpoints/
+
+# ===== Generated Plots & Visualizations =====
+eval_plots/
+correlation_maps/
 
 # ===== Python virtual environment =====
 .venv/
@@ -45,11 +54,26 @@ LightGBM-gpu/
 *.fdb_latexmk
 *.pdf
 
-# ===== OS / IDE =====
+# ===== OS / IDE / AI Agents =====
 Thumbs.db
 Desktop.ini
 .DS_Store
 .idea/
 .vscode/
+.agents/
+.claude/
+.copilot/
+copilot/
+.freebuff/
+.obsidian/
+.opencode/
+.cursor/
+
+# ===== Environment / Scratch =====
+.env
+.env.*
+!.env.example
+scratch/
+make_plan2.py
 
 graphify-out/

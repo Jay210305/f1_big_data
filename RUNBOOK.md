@@ -25,13 +25,25 @@ python -m src.run_all --force      # full rebuild from scratch
 | 2b | Verify lakehouse | `python -m src.ingest.verify_lakehouse` | console report | ~30 s |
 | 3 | Gold features | `python -m src.features.build_gold` | `data/gold/*.parquet` | ~6–8 min |
 | 3b | Verify gold | `python -m src.features.verify_gold` | console report | ~10 s |
-| 4 | RUL + cliff models | `python -m src.models.train_rul --epochs 40` | `data/models/{xgb_rul,xgb_rul_sym,lgb_rul,xgb_cliff,lgb_cliff,lstm_rul}.*` + metrics | ~30 s |
-| 4b | Eval | `python -m src.models.eval_rul` | console + per-stint sample | ~30 s |
+| 4 | RUL + cliff models | `python -m src.models.train_rul --epochs 40` | `data/models/{xgb_rul,xgb_rul_sym,lgb_rul,xgb_cliff,lgb_cliff,lstm_rul}.*` + metrics + `piecewise_blend` | ~30 s |
+| 4b | Eval | `python -m src.models.eval_rul` | console + per-stint sample (XGB vs LSTM vs Blend) | ~30 s |
 | 5 | Style profiler | `python -m src.features.micro_sectors` then `python -m src.models.train_style` | `data/gold/micro_sectors.parquet`, `driver_embeddings.parquet`, `lap_embeddings.parquet`, `style_ae.pt` | ~4 min + ~40 s |
 | 5b | Verify | `python -m src.models.verify_style` | console report | ~5 s |
 | 6 | Degradation fit | `python -m src.models.fit_degradation` | `data/models/degradation_model.json` | ~30 s |
 | 6b | Optimizer demo | `python -m src.models.optimizer` | `data/models/phase6_demo.json` | ~35 s |
 | 7 | Backtest | `python -m src.models.backtest` | `data/models/phase7_backtest.json` | ~40 s |
+
+## Engineering-hygiene tools (cross-cutting)
+
+| Task | Command | Artifacts |
+|------|---------|-----------|
+| Schema-drift validation | `python -m src.ingest.verify_schema` | `data/bronze/phase2_schema_verify.json` |
+| Feature importance + SHAP | `python -m src.models.feature_importance` | `data/models/feature_importance/*` |
+| Hyperparameter sanity/study | `python -m src.models.tune_rul [--study N]` | `data/models/tune_*.json` |
+| Cliff-threshold sensitivity | `python -m src.models.sensitivity_cliff` | `data/models/cliff_sensitivity.{json,md}` |
+| Realized-pace backtest | `python -m src.models.backtest_realized` | `data/models/phase7_backtest_realized.json` |
+| Dependency benchmark | `python -m src.verify_deps` | console report |
+| Tests + CI | `python -m pytest tests/` | `.github/workflows/ci.yml` |
 
 ## In-race recommendation (single query)
 

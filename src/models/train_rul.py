@@ -56,11 +56,36 @@ def reg_metrics(y_true, y_pred):
     ss_res = float(np.sum((yt - yp) ** 2))
     ss_tot = float(np.sum((yt - yt.mean()) ** 2)) or 1.0
     r2 = 1.0 - ss_res / ss_tot
+
     crit = yt <= CRIT_ZONE
-    mae_crit = float(np.mean(np.abs(yt[crit] - yp[crit]))) if crit.any() else float("nan")
+    n_crit = int(crit.sum())
+    if n_crit > 0:
+        yt_c, yp_c = yt[crit], yp[crit]
+        mae_crit = float(np.mean(np.abs(yt_c - yp_c)))
+        rmse_crit = float(np.sqrt(np.mean((yt_c - yp_c) ** 2)))
+        ss_res_c = float(np.sum((yt_c - yp_c) ** 2))
+        ss_tot_c = float(np.sum((yt_c - yt_c.mean()) ** 2)) or 1.0
+        r2_crit = 1.0 - ss_res_c / ss_tot_c
+    else:
+        mae_crit = rmse_crit = r2_crit = float("nan")
+
+    noncrit = ~crit
+    n_noncrit = int(noncrit.sum())
+    if n_noncrit > 0:
+        yt_nc, yp_nc = yt[noncrit], yp[noncrit]
+        mae_noncrit = float(np.mean(np.abs(yt_nc - yp_nc)))
+        rmse_noncrit = float(np.sqrt(np.mean((yt_nc - yp_nc) ** 2)))
+        ss_res_nc = float(np.sum((yt_nc - yp_nc) ** 2))
+        ss_tot_nc = float(np.sum((yt_nc - yt_nc.mean()) ** 2)) or 1.0
+        r2_noncrit = 1.0 - ss_res_nc / ss_tot_nc
+    else:
+        mae_noncrit = rmse_noncrit = r2_noncrit = float("nan")
+
     return {"MAE": mae, "RMSE": rmse, "R2": r2,
-            "MAE_crit": mae_crit, "PHM": nasa_phm_score(yt, yp),
-            "n": int(mask.sum()), "n_crit": int(crit.sum())}
+            "MAE_crit": mae_crit, "RMSE_crit": rmse_crit, "R2_crit": r2_crit,
+            "MAE_noncrit": mae_noncrit, "RMSE_noncrit": rmse_noncrit, "R2_noncrit": r2_noncrit,
+            "PHM": nasa_phm_score(yt, yp),
+            "n": int(mask.sum()), "n_crit": n_crit, "n_noncrit": n_noncrit}
 
 
 def clf_metrics(y_true, y_pred, y_prob):
@@ -172,7 +197,8 @@ def train_lgb_rul(Xtr, ytr, Xva, yva, Xte, yte):
 
 
 def train_xgb_cliff(Xtr, ytr, Xva, yva, Xte, yte):
-    """XGB + LGB probability ensemble; threshold tuned on val ensemble probs."""
+    """XGB + LGB probability ensemble; weight proportional to each member's
+    validation ROC-AUC (Task 8.H.6). Falls back to 50/50 if AUC is unreliable."""
     import xgboost as xgb
     import lightgbm as lgb
     pos = int(ytr.sum())
@@ -200,15 +226,39 @@ def train_xgb_cliff(Xtr, ytr, Xva, yva, Xte, yte):
                    callbacks=[lgb.early_stopping(40, verbose=False)])
     lm.save_model(str(MODELS_DIR / "lgb_cliff.txt"))
 
-    val_prob = 0.5 * (xm.predict(dva) + lm.predict(Xva))
-    test_prob = 0.5 * (xm.predict(dte) + lm.predict(Xte))
+    # member val probabilities
+    xgb_va = xm.predict(dva)
+    lgb_va = lm.predict(Xva)
+    xgb_te = xm.predict(dte)
+    lgb_te = lm.predict(Xte)
+
+    # --- Task 8.H.6.2: weighting proportional to validation ROC-AUC ---
+    try:
+        from sklearn.metrics import roc_auc_score
+        auc_x = float(roc_auc_score(yva, xgb_va))
+        auc_l = float(roc_auc_score(yva, lgb_va))
+    except Exception:
+        auc_x = auc_l = 0.5
+    # AUC below 0.5 is worse than random; clamp and normalize to weights.
+    auc_x = max(auc_x, 0.0)
+    auc_l = max(auc_l, 0.0)
+    if (auc_x + auc_l) <= 1e-6:
+        w_x = w_l = 0.5
+    else:
+        w_x = auc_x / (auc_x + auc_l)
+        w_l = 1.0 - w_x
+
+    val_prob = w_x * xgb_va + w_l * lgb_va
+    test_prob = w_x * xgb_te + w_l * lgb_te
     best_thr, best_val_f1, pr_points = _best_f1_threshold(yva, val_prob)
     pred = (test_prob > best_thr).astype(int)
     metrics = clf_metrics(yte, pred, test_prob)
     metrics["threshold"] = best_thr
     metrics["val_f1_at_threshold"] = best_val_f1
     metrics["w_pos"] = w_pos
-    metrics["ensemble"] = "xgb+lgb mean"
+    metrics["ensemble"] = "xgb+lgb auc-weighted"
+    metrics["ensemble_weights"] = {"xgb": round(w_x, 3), "lgb": round(w_l, 3)}
+    metrics["ensemble_auc"] = {"xgb": round(auc_x, 3), "lgb": round(auc_l, 3)}
     pr_points.sort(key=lambda x: x[0])
     summary = [pr_points[i] for i in np.linspace(0, len(pr_points) - 1, 7).astype(int)]
     metrics["pr_summary"] = [{"thr": round(t, 3), "prec": round(p, 3),
@@ -220,16 +270,16 @@ def train_xgb_cliff(Xtr, ytr, Xva, yva, Xte, yte):
 # ---------------------------------------------------------------------------
 # LSTM (target = piecewise target_rul)
 # ---------------------------------------------------------------------------
-MAXLEN = 64
+MAXLEN = 80
 
 
-def pad_batch(seqs, ruls):
+def pad_batch(seqs, ruls, maxlen=MAXLEN):
     n, f = len(seqs), seqs[0].shape[1]
-    X = np.zeros((n, MAXLEN, f), dtype=np.float32)
-    M = np.zeros((n, MAXLEN), dtype=np.float32)
-    Y = np.full((n, MAXLEN), np.nan, dtype=np.float32)
+    X = np.zeros((n, maxlen, f), dtype=np.float32)
+    M = np.zeros((n, maxlen), dtype=np.float32)
+    Y = np.full((n, maxlen), np.nan, dtype=np.float32)
     for i, (s, y) in enumerate(zip(seqs, ruls)):
-        L = min(len(s), MAXLEN)
+        L = min(len(s), maxlen)
         X[i, :L] = s[:L]
         M[i, :L] = 1
         Y[i, :L] = y[:L]
@@ -240,9 +290,17 @@ def train_lstm(seq, feats, epochs, batch_size, device):
     import torch
     import torch.nn as nn
 
-    Xtr, Mtr, Ytr = pad_batch(seq["train"]["X"], seq["train"]["y_rul"])
-    Xva, Mva, Yva = pad_batch(seq["val"]["X"], seq["val"]["y_rul"])
-    Xte, Mte, Yte = pad_batch(seq["test"]["X"], seq["test"]["y_rul"])
+    # Ensure maxlen accommodates all stints across splits (no truncation)
+    maxlen = max(
+        max(len(s) for s in seq["train"]["X"]),
+        max(len(s) for s in seq["val"]["X"]),
+        max(len(s) for s in seq["test"]["X"]),
+        MAXLEN
+    )
+
+    Xtr, Mtr, Ytr = pad_batch(seq["train"]["X"], seq["train"]["y_rul"], maxlen=maxlen)
+    Xva, Mva, Yva = pad_batch(seq["val"]["X"], seq["val"]["y_rul"], maxlen=maxlen)
+    Xte, Mte, Yte = pad_batch(seq["test"]["X"], seq["test"]["y_rul"], maxlen=maxlen)
 
     def t(a):
         return torch.from_numpy(a).to(device)
@@ -273,14 +331,18 @@ def train_lstm(seq, feats, epochs, batch_size, device):
     opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=1e-3, epochs=epochs,
-        steps_per_epoch=int(np.ceil(len(Xtr) / batch_size)))
+        steps_per_epoch=int(np.ceil(len(Xtr) / batch_size)),
+        pct_start=0.2)
 
     class AsymSmoothL1(nn.Module):
-        def forward(self, pred, target):
+        def forward(self, pred, target, mask=None):
             res = pred - target
             w = torch.where(res > 0, C2, C1)
-            return (w * nn.functional.smooth_l1_loss(
-                pred, target, reduction="none", beta=1.0)).mean()
+            raw = w * nn.functional.smooth_l1_loss(
+                pred, target, reduction="none", beta=1.0)
+            if mask is not None:
+                return (raw * mask).sum() / mask.sum().clamp(min=1.0)
+            return raw.mean()
 
     crit = AsymSmoothL1()
 
@@ -296,35 +358,40 @@ def train_lstm(seq, feats, epochs, batch_size, device):
                 xb, mb, yb = t(X[bi]), t(M[bi]), t(Y[bi])
                 p = net(xb)
                 mask = mb * torch.isfinite(yb)
-                loss = (crit(p * mask, torch.nan_to_num(yb) * mask))
+                loss = crit(p, torch.nan_to_num(yb), mask=mask)
                 if train:
-                    opt.zero_grad(); loss.backward()
+                    opt.zero_grad()
+                    loss.backward()
                     nn.utils.clip_grad_norm_(net.parameters(), 5.0)
-                    opt.step(); sched.step()
-                losses.append(float(loss.detach()) * int(mask.sum().item()))
-                n += int(mask.sum().item())
+                    opt.step()
+                    sched.step()
+                n_valid = int(mask.sum().item())
+                losses.append(float(loss.detach().item()) * n_valid)
+                n += n_valid
         return sum(losses) / max(n, 1)
 
-    best, best_state, best_epoch = 1e9, None, 0
-    patience, bad = 8, 0
+    best, best_state, best_epoch, best_lr = 1e9, None, 0, 0.0
+    patience, bad = 10, 0
     for e in range(epochs):
         tr = epoch(Xtr, Mtr, Ytr, True)
         va = epoch(Xva, Mva, Yva, False)
+        current_lr = opt.param_groups[0]["lr"]
         if va < best - 1e-4:
             best, best_epoch, bad = va, e + 1, 0
+            best_lr = current_lr
             best_state = {k: v.cpu().clone()
                           for k, v in net.state_dict().items()}
         else:
             bad += 1
         if (e + 1) % 5 == 0 or e == 0:
-            print(f"   lstm epoch {e+1:2d}  tr={tr:.4f} va={va:.4f}"
+            print(f"   lstm epoch {e+1:2d}  lr={current_lr:.6f}  tr={tr:.4f} va={va:.4f}"
                   f"  best=va{best_epoch}={best:.4f}")
         if bad >= patience:
             print(f"   lstm early stop at epoch {e+1}")
             break
     net.load_state_dict(best_state)
     torch.save(best_state, str(MODELS_DIR / "lstm_rul.pt"))
-    print(f"   lstm best epoch = {best_epoch} (val={best:.4f})")
+    print(f"   lstm best epoch = {best_epoch} (val={best:.4f}, lr={best_lr:.6f})")
 
     net.eval()
     with torch.no_grad():
@@ -334,8 +401,18 @@ def train_lstm(seq, feats, epochs, batch_size, device):
         L = int(Mte[i].sum())
         yt.extend(Yte[i, :L].tolist())
         yp.extend(pt[i, :L].tolist())
-    yp = np.clip(np.array(yp), 0, None)
-    return reg_metrics(np.array(yt), yp), yp
+    yt = np.array(yt, dtype=np.float32)
+    yp = np.clip(np.array(yp, dtype=np.float32), 0, None)
+
+    # Task 8.0.2.2: assert test-time unpadded lap count matches exactly
+    expected_laps = sum(len(y) for y in seq["test"]["y_rul"])
+    assert len(yt) == expected_laps, f"Sequence flattening dropped laps! {len(yt)} != {expected_laps}"
+
+    metrics = reg_metrics(yt, yp)
+    metrics["best_epoch"] = best_epoch
+    metrics["best_val_loss"] = round(float(best), 4)
+    metrics["lr_at_best_epoch"] = round(float(best_lr), 7)
+    return metrics, yp
 
 
 # ---------------------------------------------------------------------------
@@ -433,15 +510,28 @@ def main():
               f"R2={m_lstm['R2']:.3f} MAE_crit={m_lstm['MAE_crit']:.3f} "
               f"PHM={m_lstm['PHM']:.0f}  ({time.time()-t1:.0f}s)")
 
+        # --- Piecewise Blended RUL (Production: Option B) ---
+        print("\n[6] Piecewise Blended RUL (Production: XGBoost + LSTM)")
+        w_blend = np.clip((12.0 - pred_xgb) / 6.0, 0.0, 1.0)
+        pred_blend = w_blend * pred_lstm + (1.0 - w_blend) * pred_xgb
+        m_blend = reg_metrics(yte_r, pred_blend)
+        results["piecewise_blend"] = m_blend
+        print(f"  MAE={m_blend['MAE']:.3f} RMSE={m_blend['RMSE']:.3f} "
+              f"R2={m_blend['R2']:.3f} MAE_crit={m_blend['MAE_crit']:.3f} "
+              f"PHM={m_blend['PHM']:.0f}")
+
     # --- Save metadata + metrics ---
     meta = {"features": feats, "codes": codes,
+            "norm_means": {k: float(v) for k, v in norm[0].items()},
+            "norm_stds": {k: float(v) for k, v in norm[1].items()},
             "split": {"train": ["2021", "2022", "2023"], "val": ["2024"],
                       "test": ["2025"]},
             "target": "target_rul (piecewise, performance-based)",
             "cliff_target": "cliff_within_3 (onset within 3 laps, pure features)",
             "asymmetric_loss": {"c1": C1, "c2": C2},
             "nasa_phm": {"a1": A1, "a2": A2},
-            "naive_compound_means": comp_mean}
+            "naive_compound_means": comp_mean,
+            "blend_policy": {"type": "piecewise_linear", "rul_lo": 6.0, "rul_hi": 12.0}}
     with open(MODELS_DIR / "feature_meta.json", "w") as fh:
         json.dump(meta, fh, indent=2, default=str)
     with open(MODELS_DIR / "phase4_metrics.json", "w") as fh:
@@ -452,13 +542,15 @@ def main():
     print("PHASE 4 v2 — RUL / Cliff (refactored) — RESULTS (test 2025)")
     print("=" * 78)
     print(f"\n{'Model':18s} {'MAE':>7s} {'RMSE':>7s} {'R2':>7s} "
-          f"{'MAE<=10':>8s} {'PHM':>10s}")
+          f"{'MAE<=10':>8s} {'R2_crit':>8s} {'R2_nc':>7s} {'PHM':>10s}")
     for k in ["naive_const", "naive_compound", "lgb_rul", "xgb_rul",
-              "xgb_rul_sym", "lstm_rul"]:
+              "xgb_rul_sym", "lstm_rul", "piecewise_blend"]:
         if k in results:
             r = results[k]
+            r2_c = f"{r.get('R2_crit', float('nan')):8.3f}"
+            r2_nc = f"{r.get('R2_noncrit', float('nan')):7.3f}"
             print(f"{k:18s} {r['MAE']:7.3f} {r['RMSE']:7.3f} {r['R2']:7.3f} "
-                  f"{r['MAE_crit']:8.3f} {r['PHM']:10.0f}")
+                  f"{r['MAE_crit']:8.3f} {r2_c} {r2_nc} {r['PHM']:10.0f}")
     c = results["xgb_cliff"]
     print(f"\nCliff (onset within 3 laps, NO leakage):")
     print(f"  threshold={c['threshold']:.3f} prec={c['precision']:.3f} "

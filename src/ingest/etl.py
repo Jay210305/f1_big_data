@@ -34,6 +34,20 @@ _NULL_TYPES = {"float": pl.Float64, "int": pl.Int32,
                "bool": pl.Boolean, "str": pl.Utf8}
 
 
+def _record_error(stats: dict, exc: Exception, stage: str,
+                  context: dict | None = None) -> None:
+    """Record a structured error instead of a bare counter increment.
+
+    Captures the exception type and message plus the pipeline stage and any
+    context (driver, lap, file) so failures are diagnosable after the run.
+    """
+    stats["errors"] += 1
+    entry = {"stage": stage, "type": type(exc).__name__, "message": str(exc)}
+    if context:
+        entry["context"] = context
+    stats["error_log"].append(entry)
+
+
 def _slug(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
     return s or "x"
@@ -213,7 +227,8 @@ def process_session(task: tuple) -> dict:
     slug = f"{_slug(gp)}__{_slug(session)}"
     stats = {"season": year, "gp": gp, "session": session,
              "laps": 0, "bronze_rows": 0, "silver_rows": 0,
-             "weather": 0, "corners": 0, "rcm": 0, "errors": 0}
+             "weather": 0, "corners": 0, "rcm": 0, "errors": 0,
+             "error_log": []}
 
     bronze_dfs: list[pl.DataFrame] = []
     silver_rows: list[pl.DataFrame] = []
@@ -231,8 +246,9 @@ def process_session(task: tuple) -> dict:
             try:
                 data = _load_json(f)
                 inner = data.get("tel", data)
-            except Exception:
-                stats["errors"] += 1
+            except Exception as exc:
+                _record_error(stats, exc, "load_telemetry",
+                              {"driver": driver, "lap": lap, "file": f.name})
                 continue
             if not isinstance(inner, dict) or not any(isinstance(v, list) for v in inner.values()):
                 continue
@@ -244,8 +260,9 @@ def process_session(task: tuple) -> dict:
                     stats["bronze_rows"] += bdf.height
                     silver_rows.append(bdf.select(_silver_exprs(bdf.columns, meta)))
                     stats["laps"] += 1
-            except Exception:
-                stats["errors"] += 1
+            except Exception as exc:
+                _record_error(stats, exc, "normalize_telemetry",
+                              {"driver": driver, "lap": lap})
 
     if bronze_dfs and C.WRITE_BRONZE:
         try:
@@ -253,8 +270,8 @@ def process_session(task: tuple) -> dict:
             bdir.mkdir(parents=True, exist_ok=True)
             pl.concat(bronze_dfs).write_parquet(
                 bdir / f"{slug}.parquet", compression=C.COMPRESSION)
-        except Exception:
-            stats["errors"] += 1
+        except Exception as exc:
+            _record_error(stats, exc, "write_bronze", {"file": f"{slug}.parquet"})
 
     if silver_rows:
         try:
@@ -267,8 +284,8 @@ def process_session(task: tuple) -> dict:
             sdir.mkdir(parents=True, exist_ok=True)
             sdf.write_parquet(sdir / f"{slug}.parquet", compression=C.COMPRESSION)
             stats["silver_rows"] = sdf.height
-        except Exception:
-            stats["errors"] += 1
+        except Exception as exc:
+            _record_error(stats, exc, "write_silver", {"file": f"{slug}.parquet"})
 
     for fname, key, sub in [
         ("weather.json", "weather", "weather"),
@@ -285,8 +302,8 @@ def process_session(task: tuple) -> dict:
                 edir.mkdir(parents=True, exist_ok=True)
                 edf.write_parquet(edir / f"{slug}.parquet", compression=C.COMPRESSION)
                 stats[key] = edf.height
-        except Exception:
-            stats["errors"] += 1
+        except Exception as exc:
+            _record_error(stats, exc, f"write_{sub}", {"file": fname})
 
     return stats
 
@@ -354,11 +371,17 @@ def main() -> None:
     ctx = get_context("spawn")
     agg = {"laps": 0, "bronze_rows": 0, "silver_rows": 0,
            "weather": 0, "corners": 0, "rcm": 0, "errors": 0, "sessions_done": 0}
+    error_log: list[dict] = []
     with ctx.Pool(args.workers) as pool:
         for i, st in enumerate(pool.imap_unordered(process_session, tasks), 1):
             for k in ["laps", "bronze_rows", "silver_rows", "weather",
                       "corners", "rcm", "errors"]:
                 agg[k] += st.get(k, 0)
+            for entry in st.get("error_log", []):
+                entry.setdefault("season", st["season"])
+                entry.setdefault("gp", st["gp"])
+                entry.setdefault("session", st["session"])
+                error_log.append(entry)
             agg["sessions_done"] = i
             print(f"[{i:>4}/{len(tasks)}] {st['season']} {st['gp']} "
                   f"{st['session']}  laps={st['laps']} bronze={st['bronze_rows']} "
@@ -380,8 +403,20 @@ def main() -> None:
     print(f"  rcm      : {agg['rcm']:,}")
     print(f"  errors   : {agg['errors']:,}")
 
+    if error_log:
+        from collections import Counter
+        by_stage = Counter(e["stage"] for e in error_log)
+        print("\nError breakdown by stage:")
+        for stage, n in by_stage.most_common():
+            print(f"  {stage:22s} {n:>6d}")
+        by_type = Counter(e["type"] for e in error_log)
+        print("Error breakdown by exception type:")
+        for typ, n in by_type.most_common():
+            print(f"  {typ:22s} {n:>6d}")
+
     report = {**agg, "elapsed_sec": el, "years": args.years,
-              "sessions_filter": args.sessions, "bronze": C.WRITE_BRONZE}
+              "sessions_filter": args.sessions, "bronze": C.WRITE_BRONZE,
+              "error_log": error_log}
     C.BRONZE_DIR.mkdir(parents=True, exist_ok=True)
     with open(C.ROOT / "data" / "bronze" / "phase2_etl_report.json", "w",
               encoding="utf-8") as fh:

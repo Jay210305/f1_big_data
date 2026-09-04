@@ -1,0 +1,37 @@
+[project]
+name = "f1-tyre-strategy"
+version = "1.0.0"
+description = "F1 prescriptive tyre & stint strategy engine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "polars>=1.5",
+    "pyarrow>=17.0",
+    "duckdb>=1.1",
+    "fastparquet>=2024.5.0",
+    "zstandard>=0.23",
+    "scipy>=1.13",
+    "scikit-learn>=1.5",
+    "xgboost>=2.1",
+    "lightgbm>=4.5",
+    "hdbscan>=0.8.38",
+    "jupyter>=1.0",
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+    "shap>=0.46",
+    "optuna>=3.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+# torch is deliberately excluded: it must be installed separately with CUDA
+# wheels for the RTX 5070 Ti (Blackwell, sm_120). See Phase 0 / requirements.txt.
