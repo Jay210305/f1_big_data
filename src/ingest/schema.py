@@ -58,6 +58,9 @@ WEATHER_COLUMNS: list[str] = ["wT", "wAT", "wH", "wP", "wR", "wTT", "wWD", "wWS"
 CORNERS_COLUMNS: list[str] = ["CornerNumber", "X", "Y", "Angle", "Distance", "Rotation"]
 
 # rcm.json (Race Control Messages) channels.
+# Note: FastF1 classifies both physical Safety Car and Virtual Safety Car events
+# under cat='SafetyCar' (e.g. 'VIRTUAL SAFETY CAR DEPLOYED', 'SAFETY CAR IN THIS LAP').
+# Steward penalty/infringement notes are typically filed under cat='Other'.
 RCM_COLUMNS: list[str] = ["time", "cat", "msg", "status", "flag", "scope",
                           "sector", "dNum", "lap"]
 

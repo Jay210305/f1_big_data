@@ -23,12 +23,14 @@ import polars as pl
 from src.ingest.config import ROOT
 from src.models.eval_rul import build_labeled_frame
 from src.models.rul_data import STINT_KEYS, load_lap_features
-from src.models.style_data import _track_evolution
+from src.models.style_data import INSTANT_WET, WET_COMPOUNDS, WET_EFFICIENCY, _track_evolution
 
 GOLD = ROOT / "data" / "gold"
 MODELS_DIR = ROOT / "data" / "models"
 DRY = ["SOFT", "MEDIUM", "HARD"]
+COMPOUNDS = DRY + WET_COMPOUNDS
 N_QUANT = 25
+SC_HAZARD_MIN_LAP = 1
 
 # scenario dirty-air anchors (Task 8.0.4 Option A). Because dirty_air_frac is
 # sparse (90th percentile ~0.05, max ~0.26 across dry stints), the DR/backmarker
@@ -152,6 +154,112 @@ def _fit_dirty_air(stinfo: pl.DataFrame) -> dict:
     return {"fit": fit, "scenario_beta_mult": scenario_beta_mult, "notes": notes}
 
 
+def _wet_context(df: pl.DataFrame) -> pl.DataFrame:
+    """Add bounded rain intensity and track-drying proxies to lap rows."""
+    tei = _track_evolution(load_lap_features().with_columns(
+        pl.col("season").cast(pl.Utf8)))
+    cols = ["season", "gp", "session", "lap", "track_evolution_index",
+            "is_wet_lap"]
+    out = df.join(tei.select(cols), on=["season", "gp", "session", "lap"],
+                  how="left")
+    rain = pl.col("rain_flag").cast(pl.Float64).fill_null(0.0) \
+        if "rain_flag" in out.columns else pl.lit(0.0)
+    tei_max = pl.col("track_evolution_index").max().over(
+        ["season", "gp", "session"])
+    return out.with_columns([
+        rain.alias("rain_intensity"),
+        pl.when(tei_max > 0)
+        .then((pl.col("track_evolution_index") / tei_max).clip(0.0, 1.0))
+        .otherwise(0.0).alias("track_drying_proxy"),
+    ])
+
+
+def _contiguous_runs(laps):
+    """Return inclusive contiguous lap intervals from an iterable of laps."""
+    values = sorted({int(lap) for lap in laps if lap is not None})
+    if not values:
+        return []
+    runs = []
+    start = previous = values[0]
+    for lap in values[1:]:
+        if lap != previous + 1:
+            runs.append((start, previous))
+            start = lap
+        previous = lap
+    runs.append((start, previous))
+    return runs
+
+
+def _fit_sc_hazard() -> dict:
+    """Fit empirical SC/VSC onset hazards and affected-window durations.
+
+    The hazard is conditional on the race still being green at the start of a
+    lap. Each race contributes one exposure at every lap before its first
+    neutralisation and one onset event at the first affected lap. This keeps
+    the table suitable for sequential Monte Carlo sampling.
+    """
+    from src.models.rul_data import load_sc_laps
+
+    try:
+        sc_laps = load_sc_laps()
+        lap_features = load_lap_features().filter(pl.col("session") == "Race")
+    except Exception as exc:
+        return {"method": "empirical_first_onset_survival", "error": str(exc),
+                "lap_hazard": {}, "circuit_prior": {}, "duration_laps": [1]}
+
+    if sc_laps.is_empty() or lap_features.is_empty():
+        return {"method": "empirical_first_onset_survival", "n_races": 0,
+                "lap_hazard": {}, "circuit_prior": {}, "duration_laps": [1]}
+
+    races = (lap_features.group_by(["season", "gp", "session"])
+             .agg(pl.col("lap").max().alias("n_laps")))
+    sc = sc_laps.filter(pl.col("session") == "Race")
+    by_race = {(str(row["season"]), row["gp"]): row["lap"]
+               for row in sc.group_by(["season", "gp"])
+               .agg(pl.col("lap").sort()).to_dicts()}
+    exposure = {}
+    onset = {}
+    durations = []
+    circuit_races = {}
+    for row in races.to_dicts():
+        circuit = row["gp"]
+        key = (str(row["season"]), circuit)
+        n_laps = int(row["n_laps"] or 0)
+        affected = by_race.get(key, [])
+        runs = _contiguous_runs(affected)
+        first_onset = runs[0][0] if runs else None
+        circuit_races[circuit] = circuit_races.get(circuit, 0) + 1
+        for lap in range(SC_HAZARD_MIN_LAP, n_laps + 1):
+            if first_onset is not None and lap >= first_onset:
+                break
+            exposure[(circuit, lap)] = exposure.get((circuit, lap), 0) + 1
+        if first_onset is not None:
+            onset[(circuit, first_onset)] = onset.get((circuit, first_onset), 0) + 1
+            durations.append(runs[0][1] - runs[0][0] + 1)
+
+    hazard = {}
+    for (circuit, lap), n_exposed in exposure.items():
+        hazard.setdefault(circuit, {})[str(lap)] = round(
+            onset.get((circuit, lap), 0) / n_exposed, 6)
+    circuit_prior = {}
+    for circuit, n_races in circuit_races.items():
+        events = sum(1 for (name, _), count in onset.items()
+                     if name == circuit for _ in range(count))
+        circuit_prior[circuit] = round(events / max(n_races, 1), 6)
+    result = {
+        "method": "empirical_first_onset_survival",
+        "season_range": ["2021", "2025"],
+        "n_races": sum(circuit_races.values()),
+        "n_onsets": sum(onset.values()),
+        "lap_hazard": hazard,
+        "circuit_prior": circuit_prior,
+        "duration_laps": sorted(set(durations)) or [1],
+        "duration_mean": round(float(np.mean(durations)), 3) if durations else 1.0,
+        "notes": "First SC/VSC onset per race; hazard is conditional on prior green laps.",
+    }
+    return result
+
+
 def fit_degradation(df=None, save=True):
     print("[deg] building labeled frame (Race/Sprint, filtered stints)...")
     if df is None:
@@ -162,13 +270,17 @@ def fit_degradation(df=None, save=True):
                  on=["season", "driver"], how="left")
     df = df.with_columns(pl.col("cluster").fill_null(-1).cast(pl.Int32))
 
-    dry = df.filter(pl.col("compound").is_in(DRY))
+    df = _wet_context(df)
+    dry = df.filter(pl.col("compound").is_in(COMPOUNDS))
     dry = dry.sort(STINT_KEYS + ["life"])
     # stint position: skip out-lap + first 2 flying laps (tyre warm-up and
     # race-start traffic bias the slope negative / trigger false cliffs)
     dry = dry.with_columns(
         pl.int_range(pl.len()).over(STINT_KEYS).alias("_pos"))
     dry = dry.filter(pl.col("_pos") >= 3)
+    # Task 8.1.2.3: Mask out any lap tagged as SC/VSC from degradation slope regression
+    if "is_sc_lap" in dry.columns:
+        dry = dry.filter(pl.col("is_sc_lap") == 0)
     # per-stint slope via cov/var (equivalent to OLS slope on life)
     dry = dry.with_columns(
         ((pl.cov("life", "fuel_corr") / pl.var("life")).over(STINT_KEYS))
@@ -180,14 +292,17 @@ def fit_degradation(df=None, save=True):
         pl.col("compound").first().over(STINT_KEYS).alias("comp"),
         pl.col("cluster").first().over(STINT_KEYS).alias("clu"),
         pl.col("dirty_air_frac").mean().over(STINT_KEYS).alias("daf"),
+        pl.col("rain_intensity").mean().over(STINT_KEYS).alias("rain"),
+        pl.col("track_drying_proxy").mean().over(STINT_KEYS).alias("drying"),
     )
     st = (dry.filter((pl.col("n_laps") >= 4) & pl.col("beta").is_not_null())
           .group_by(STINT_KEYS)
           .agg(pl.col("beta").first(), pl.col("n_laps").first(),
                pl.col("t_end").first(), pl.col("life0").first(),
                pl.col("temp").first(), pl.col("comp").first(),
-               pl.col("clu").first(), pl.col("daf").first()))
-    print(f"[deg] {st.shape[0]:,} dry stints (pos>=3, warm-up excluded)")
+               pl.col("clu").first(), pl.col("daf").first(),
+               pl.col("rain").first(), pl.col("drying").first()))
+    print(f"[deg] {st.shape[0]:,} tyre stints (pos>=3, warm-up excluded)")
 
     beta_g = float(st["beta"].median())
     params = {
@@ -196,6 +311,10 @@ def fit_degradation(df=None, save=True):
         "temp_coef": 0.0, "temp_mean": float(st["temp"].mean() or 0.0),
         "cliff": {}, "n_stints": st.shape[0],
         "cliff_jump": 1.5, "cliff_slope": 0.15,
+        "wet_context": {"wet_efficiency": WET_EFFICIENCY,
+                "instant_wet": INSTANT_WET,
+                "rain_feature": "rain_intensity",
+                "drying_feature": "track_drying_proxy"},
         "notes": ("slopes fitted on stint positions >=3 (warm-up/traffic "
                   "excluded); cliff distribution excludes cliff_at < 3 "
                   "(race-start traffic artifacts, counted as censored); "
@@ -203,11 +322,13 @@ def fit_degradation(df=None, save=True):
                   "sigma is IQR-robust (raw std destroyed by traffic outliers); "
                   "cliff cost = one-time jump + 0.15 s/lap beyond the cliff"),
     }
-    for c in DRY:
+    for c in COMPOUNDS:
         sub = st.filter(pl.col("comp") == c)
         if sub.height < 5:
             params["beta"][c] = beta_g
             params["sigma"][c] = float(st["beta"].std() or 0.05)
+            params["cliff"][c] = {"censor_prob": 1.0,
+                                  "quantiles": [20.0]}
             continue
         params["beta"][c] = float(sub["beta"].median())
         # robust sigma (IQR-based): raw std is destroyed by traffic-locked
@@ -253,7 +374,7 @@ def fit_degradation(df=None, save=True):
     # HARD-MEDIUM gap, where M->H one-stoppers run HARD late on a rubbered track).
     tei = _track_evolution(load_lap_features().with_columns(
         pl.col("season").cast(pl.Utf8)))
-    laps = df.filter(pl.col("compound").is_in(DRY)).join(
+    laps = df.filter(pl.col("compound").is_in(COMPOUNDS)).join(
         tei, on=["season", "gp", "session", "lap"], how="left")
     stint_agg = (laps.group_by(["season", "gp", "session", "driver", "compound"])
                  .agg(pl.col("fuel_corr").min().alias("best"),
@@ -311,6 +432,16 @@ def fit_degradation(df=None, save=True):
     off_h = float(np.clip(off_h, 0.01, 2.0))
     params["pace_offset"] = {"SOFT": round(off_s, 4), "MEDIUM": 0.0,
                              "HARD": round(off_h, 4)}
+    for comp, fallback in (("INTERMEDIATE", 1.5), ("WET", 3.0)):
+        if comp not in params["beta"]:
+            params["beta"][comp] = beta_g
+        params["pace_offset"][comp] = round(
+            float(params["pace_offset"].get(comp, fallback)), 4)
+    params["wet_context_fit"] = {
+        "mean_rain_intensity": float(st["rain"].mean() or 0.0),
+        "mean_track_drying_proxy": float(st["drying"].mean() or 0.0),
+        "n_wet_stints": int(st.filter(pl.col("comp").is_in(WET_COMPOUNDS)).height),
+    }
     params["pace_offset_tei_fit"] = {
         "SOFT": {k: (round(v, 4) if isinstance(v, float) else v)
                  for k, v in fit_s.items()},
@@ -332,6 +463,7 @@ def fit_degradation(df=None, save=True):
     params["dirty_air_fit"] = daf_fit["fit"]
     params["scenario_beta_mult"] = daf_fit["scenario_beta_mult"]
     params["scenario_notes"] = daf_fit["notes"]
+    params["sc_hazard"] = _fit_sc_hazard()
 
     if not save:
         return params

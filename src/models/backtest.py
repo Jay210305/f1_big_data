@@ -36,6 +36,7 @@ from src.models import optimizer as OPT
 from src.models.eval_rul import build_labeled_frame
 from src.models.fit_degradation import fit_degradation
 from src.models.rul_data import STINT_KEYS
+from src.models.style_data import WET_COMPOUNDS
 
 MODELS_DIR = ROOT / "data" / "models"
 GOLD = ROOT / "data" / "gold"
@@ -76,6 +77,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-sims", type=int, default=250)
     ap.add_argument("--races", type=int, default=0, help="cap # races (0=all)")
+    ap.add_argument("--sc-hazard", action="store_true",
+                    help="evaluate the empirical SC/VSC hazard scenario")
+    ap.add_argument("--pit-loss-sc", type=float, default=None,
+                    help="pit loss under SC/VSC (default: pit-loss / 3)")
     args = ap.parse_args()
     t0 = time.time()
     ns = args.n_sims
@@ -97,17 +102,11 @@ def main():
     actual = actual_strategies(lapf)
     print(f"[bt] {len(actual)} driver-races in 2025")
 
-    # exclude rain-affected races: wet-compound strategies cannot be scored
-    # by the dry degradation model
-    wet = (lapf.filter((pl.col("season") == "2025") & (pl.col("session") == "Race"))
-           .group_by("gp").agg(
-               (pl.col("compound").is_in(["INTERMEDIATE", "WET"]).mean())
-               .alias("wet_frac")))
-    wet_races = {r["gp"] for r in wet.to_dicts() if r["wet_frac"] > 0.02}
-    print(f"[bt] excluding {len(wet_races)} rain-affected races: "
-          f"{sorted(wet_races)}")
+    wet_races = sorted({k[1] for k, stints in actual.items()
+                         if any(c in WET_COMPOUNDS for c, _, _ in stints)})
+    print(f"[bt] including {len(wet_races)} rain-affected races: {wet_races}")
 
-    races = sorted({k[1] for k in actual} - wet_races)
+    races = sorted({k[1] for k in actual})
     if args.races:
         races = races[:args.races]
 
@@ -136,23 +135,32 @@ def main():
             except SystemExit:
                 skipped += 1
                 continue
-            if state["compound"] not in ("SOFT", "MEDIUM", "HARD"):
+            if state["compound"] not in OPT.COMPOUNDS:
                 skipped += 1
                 continue
             # actual remaining strategy: pit now, then the real stints
             actual_strat = [(state["compound"], e0, True)] + [
-                (c, e, False) for c, s, e in stints[1:] if c in
-                ("SOFT", "MEDIUM", "HARD")]
+                (c, e, False) for c, s, e in stints[1:] if c in OPT.COMPOUNDS]
             if not any(not cur for _, _, cur in actual_strat):
                 skipped += 1
                 continue
+            scenarios = OPT.load_scenarios(
+                params, include_sc=args.sc_hazard,
+                pit_loss_sc=args.pit_loss_sc, circuit=race)
+            scenario_name = "sc_hazard" if args.sc_hazard else "clean_air"
+            scenario = scenarios[scenario_name]
+            sc_windows = None
+            if args.sc_hazard:
+                sc_windows = OPT._sample_sc_windows(
+                    np.random.default_rng(7), scenario["sc_hazard"], ns,
+                    state["n_laps"])
+                scenario = {**scenario, "_sc_windows": sc_windows}
             # paired MC evaluation (common random numbers)
             rng_a = np.random.default_rng(7)
             act = OPT.simulate(actual_strat, state, params,
-                               OPT.SCENARIOS["clean_air"], ns, rng_a)
-            rec = OPT.optimize(state, params, ns,
-                               {"clean_air": OPT.SCENARIOS["clean_air"]})
-            best = rec["clean_air"][0]
+                               scenario, ns, rng_a, sc_windows=sc_windows)
+            rec = OPT.optimize(state, params, ns, {scenario_name: scenario})
+            best = rec[scenario_name][0]
             rows.append({
                 "gp": race, "driver": key[3],
                 "actual_stops": sum(1 for c, e, cur in actual_strat if not cur),
@@ -175,6 +183,7 @@ def main():
     summary = {
         "n_decisions": len(rows), "skipped": skipped,
         "n_races": len(races), "n_sims": ns,
+        "scenario": "sc_hazard" if args.sc_hazard else "clean_air",
         "win_rate": round(wins / max(len(rows), 1), 3),
         "delta_mean": round(float(deltas.mean()), 1) if len(rows) else None,
         "delta_median": round(float(np.median(deltas)), 1) if len(rows) else None,
@@ -184,7 +193,8 @@ def main():
         "mean_rec_stops": round(float(np.mean([r["rec_stops"] for r in rows])), 2) if rows else None,
     }
     print("\n" + "=" * 78)
-    print("PHASE 7 â€” BACKTEST (2025 races, decision at stint-1 end, clean air)")
+    print(f"PHASE 7 BACKTEST (2025 races, decision at stint-1 end, "
+          f"{summary['scenario']})")
     print("=" * 78)
     print(f"  decisions      : {summary['n_decisions']}  "
           f"({summary['skipped']} skipped)")
@@ -249,7 +259,8 @@ def main():
            "decisions": rows[:200],
            "notes": ("Degradation params refit on 2021-2024 only; paired MC "
                      "with common random numbers; recommended strategy chosen "
-                     "by the same simulator (selection bias documented).")}
+                     "by the same simulator (selection bias documented). "
+                     f"Scenario: {summary['scenario']}.")}
     with open(MODELS_DIR / "phase7_backtest.json", "w") as fh:
         json.dump(out, fh, indent=2, default=str)
     print(f"\n[bt] saved -> {MODELS_DIR / 'phase7_backtest.json'} "

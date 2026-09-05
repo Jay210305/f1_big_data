@@ -32,6 +32,7 @@ python -m src.run_all --force      # full rebuild from scratch
 | 6 | Degradation fit | `python -m src.models.fit_degradation` | `data/models/degradation_model.json` | ~30 s |
 | 6b | Optimizer demo | `python -m src.models.optimizer` | `data/models/phase6_demo.json` | ~35 s |
 | 7 | Backtest | `python -m src.models.backtest` | `data/models/phase7_backtest.json` | ~40 s |
+| 8.2.1 | SC/VSC hazard fit + optimizer | `python -m src.models.fit_degradation` then `python -m src.models.optimizer --sc-hazard` | `data/models/degradation_model.json` (`sc_hazard`) + `phase6_demo.json` | ~30 s + demo |
 
 ## Engineering-hygiene tools (cross-cutting)
 
@@ -50,11 +51,66 @@ python -m src.run_all --force      # full rebuild from scratch
 ```powershell
 python -m src.models.optimizer --season 2025 --gp "Bahrain Grand Prix" `
     --driver VER --lap 12 --n-sims 500 --pit-loss 21
+
+# Include empirical SC/VSC windows and discounted pit loss (default: 21 / 3 s)
+python -m src.models.optimizer --season 2025 --gp "Bahrain Grand Prix" `
+  --driver VER --lap 12 --n-sims 500 --pit-loss 21 --sc-hazard
 ```
 
-Outputs: ranked strategies per scenario (clean air / DRS train / backmarker)
-with p5–p95 confidence bands, plus the pit-monitor backtest for that driver
+Outputs: ranked strategies per scenario (clean air / DRS train / backmarker;
+optionally empirical SC/VSC hazard) with p5–p95 confidence bands, plus the pit-monitor backtest for that driver
 (debounced cliff alerts + joint cliff/RUL anomaly rule).
+
+## Tier 3 — pre-race and what-if
+
+Pre-race planning uses the driver's longest available Practice 2 stints as
+the pace prior (falling back to another Practice session when FP2 is absent).
+The state starts at lap 0 and does not build the race-only labelled frame:
+
+```powershell
+python -m src.models.optimizer --pre-race --season 2025 `
+  --gp "Bahrain Grand Prix" --driver VER --starting-compound MEDIUM --n-sims 500
+```
+
+Add the Tier 2 stochastic branch point to print separate green-flag and
+SC/VSC-window plans, including p5-p95 bands and the SC-minus-green delta:
+
+```powershell
+python -m src.models.optimizer --pre-race --sc-hazard --season 2025 `
+  --gp "Bahrain Grand Prix" --driver VER --starting-compound MEDIUM --n-sims 500
+```
+Compare two explicit plans with common random numbers. The first segment must
+match the current compound and both plans must finish at `end`:
+
+```powershell
+python -m src.models.optimizer --season 2025 --gp "Bahrain Grand Prix" `
+  --driver VER --lap 12 --compare `
+  "HARD->18,MEDIUM->end" "HARD->23,SOFT->end" --n-sims 1000
+```
+
+The comparator prints the paired A minus B time delta, its 90% simulation
+interval, and the probability that strategy A is faster. `laptime` is used as
+the Practice pace proxy because `fuel_corr` is generated only for race labels.
+
+## Tier 4 — wet weather and live timing
+
+Refit the degradation model to include `INTERMEDIATE` and `WET` stints, then
+run the wet-aware backtest:
+
+```powershell
+python -m src.models.fit_degradation
+python -m src.models.backtest --n-sims 250
+```
+
+The live updater consumes one normalized lap at a time. An offline JSON replay
+can be inspected with the dashboard; OpenF1 is an optional source adapter:
+
+```powershell
+streamlit run app/streamlit_app.py
+```
+
+See `annotations/phase_8_4_1_wet_weather.md` and
+`annotations/phase_8_4_2_live_tool.md` for model assumptions and payload shape.
 
 ## Data footprint (after full run)
 
@@ -77,6 +133,7 @@ with p5–p95 confidence bands, plus the pit-monitor backtest for that driver
 - Optimizer leans 1-stop vs actual field behaviour (1.33 vs 1.66 avg stops).
 - Pit loss is circuit-constant (default 21 s).
 - Scenario multipliers (clean air / DRS / backmarker) are priors, not fitted.
-- Wet races are excluded from the backtest (dry model only).
+- Wet compounds use first-order rain and track-drying proxies; detailed
+  rainfall intensity remains a future data-source improvement.
 - Backtest comparison shares the simulator between recommender and evaluator
   (selection bias documented in `annotations/phase_7_report.md`).

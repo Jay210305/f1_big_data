@@ -74,14 +74,95 @@ def load_lap_features() -> pl.DataFrame:
 # SC/VSC lap detection from race control messages (spec Task 1.1)
 # ---------------------------------------------------------------------------
 def load_sc_laps() -> pl.DataFrame:
-    """Return (season, gp, session, lap) rows for SC/VSC/red-flag-affected laps."""
+    """Return (season, gp, session, lap) rows for SC/VSC/red-flag-affected laps.
+
+    Captures:
+      - Category signatures: 'SafetyCar', 'VirtualSafetyCar', 'VSC'
+      - Verified deployment, ending, and pit-procedure message patterns for SC & VSC
+        (guarding against steward infringement/penalty notices)
+      - Full period expansion (generate_series from start_lap to end_lap) for all
+        active SC/VSC intervals across races
+      - Flag signatures: DOUBLE YELLOW, RED
+    """
     glob = str(SILVER_DIR / "race_events" / "rcm" / "**" / "*.parquet").replace("\\", "/")
     con = duckdb.connect()
     df = con.execute(f"""
-        SELECT DISTINCT season, gp, session, lap
-        FROM read_parquet('{glob}', hive_partitioning=1)
-        WHERE (cat = 'SafetyCar')
-           OR (flag IN ('DOUBLE YELLOW', 'RED'))
+        WITH raw_events AS (
+            SELECT DISTINCT season, gp, session, msg, lap,
+                   row_number() OVER (PARTITION BY season, gp, session ORDER BY lap, time) as rn
+            FROM read_parquet('{glob}', hive_partitioning=1)
+            WHERE (
+                cat IN ('SafetyCar', 'VirtualSafetyCar', 'VSC')
+                OR (
+                    upper(msg) LIKE '%SAFETY CAR%'
+                    AND upper(msg) NOT LIKE '%INFRINGEMENT%'
+                    AND upper(msg) NOT LIKE '%PENALTY%'
+                    AND upper(msg) NOT LIKE '%UNDER INVESTIGATION%'
+                    AND upper(msg) NOT LIKE '%NOTED%'
+                    AND upper(msg) NOT LIKE '%REVIEWED%'
+                    AND upper(msg) NOT LIKE '%LIGHTS ON%'
+                )
+                OR (
+                    (upper(msg) LIKE '%VIRTUAL SAFETY CAR%' OR upper(msg) LIKE '%VSC%')
+                    AND upper(msg) NOT LIKE '%INFRINGEMENT%'
+                    AND upper(msg) NOT LIKE '%PENALTY%'
+                    AND upper(msg) NOT LIKE '%UNDER INVESTIGATION%'
+                    AND upper(msg) NOT LIKE '%NOTED%'
+                    AND upper(msg) NOT LIKE '%REVIEWED%'
+                    AND upper(msg) NOT LIKE '%TEST%'
+                )
+            )
+            AND lap IS NOT NULL
+        ),
+        deploy_events AS (
+            SELECT season, gp, session, lap as start_lap, rn,
+                   CASE WHEN upper(msg) LIKE '%VIRTUAL%' THEN 'VSC' ELSE 'SC' END as sc_type
+            FROM raw_events
+            WHERE upper(msg) LIKE '%DEPLOYED%'
+        ),
+        end_events AS (
+            SELECT season, gp, session, lap as end_lap, rn,
+                   CASE WHEN upper(msg) LIKE '%VIRTUAL%' THEN 'VSC' ELSE 'SC' END as sc_type
+            FROM raw_events
+            WHERE upper(msg) LIKE '%ENDING%'
+               OR upper(msg) LIKE '%IN THIS LAP%'
+               OR upper(msg) LIKE '%WILL ENTER PITS%'
+        ),
+        matched_periods AS (
+            SELECT d.season, d.gp, d.session, d.start_lap,
+                   coalesce(
+                       (SELECT min(e.end_lap) FROM end_events e
+                        WHERE e.season = d.season AND e.gp = d.gp AND e.session = d.session
+                          AND e.end_lap >= d.start_lap AND e.rn > d.rn AND e.sc_type = d.sc_type),
+                       d.start_lap
+                   ) as end_lap
+            FROM deploy_events d
+        ),
+        expanded_laps AS (
+            SELECT season, gp, session, unnest(generate_series(start_lap, end_lap)) as lap
+            FROM matched_periods
+        ),
+        discrete_laps AS (
+            SELECT DISTINCT season, gp, session, lap
+            FROM read_parquet('{glob}', hive_partitioning=1)
+            WHERE (
+                flag IN ('DOUBLE YELLOW', 'RED')
+                OR (cat IN ('SafetyCar', 'VirtualSafetyCar', 'VSC') AND lap IS NOT NULL)
+                OR (
+                    upper(msg) LIKE '%SAFETY CAR%'
+                    AND upper(msg) NOT LIKE '%INFRINGEMENT%'
+                    AND upper(msg) NOT LIKE '%PENALTY%'
+                    AND upper(msg) NOT LIKE '%UNDER INVESTIGATION%'
+                    AND upper(msg) NOT LIKE '%NOTED%'
+                    AND upper(msg) NOT LIKE '%REVIEWED%'
+                    AND upper(msg) NOT LIKE '%LIGHTS ON%'
+                    AND lap IS NOT NULL
+                )
+            )
+        )
+        SELECT DISTINCT season, gp, session, lap FROM expanded_laps
+        UNION
+        SELECT DISTINCT season, gp, session, lap FROM discrete_laps
     """).fetchdf()
     return pl.from_pandas(df).with_columns(pl.col("season").cast(pl.Utf8))
 
@@ -126,7 +207,7 @@ def add_fuel_corr(df: pl.DataFrame) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 # Causal rolling features per stint (spec Task 4)
 # ---------------------------------------------------------------------------
-def compute_rolling_features(df: pl.DataFrame) -> pl.DataFrame:
+def _compute_rolling_features_raw(df: pl.DataFrame) -> pl.DataFrame:
     df = df.sort(STINT_KEYS + ["life"])
     fc = pl.col("fuel_corr")
 
@@ -197,6 +278,28 @@ def compute_rolling_features(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def compute_rolling_features(df: pl.DataFrame) -> pl.DataFrame:
+    df = df.sort(STINT_KEYS + ["life"])
+    # Option B (Task 8.1.2): If is_sc_lap is present and carries SC laps, compute
+    # rolling pace features over green-flag racing laps only, then re-join and
+    # forward-fill across SC laps. This prevents 20-40s SC delta laptimes from
+    # corrupting rolling pace windows while preserving sequence continuity for tyre life.
+    has_sc = "is_sc_lap" in df.columns and (df["is_sc_lap"] == 1).any()
+    if has_sc:
+        orig_cols = set(df.columns)
+        green = df.filter(pl.col("is_sc_lap") == 0)
+        green = _compute_rolling_features_raw(green)
+        roll_cols = [c for c in green.columns if c not in orig_cols]
+        df = df.join(green.select(STINT_KEYS + ["life"] + roll_cols),
+                     on=STINT_KEYS + ["life"], how="left")
+        # Forward-fill (and backward-fill if stint starts under SC) per stint
+        for c in roll_cols:
+            df = df.with_columns(
+                pl.col(c).forward_fill().backward_fill().over(STINT_KEYS))
+        return df
+    return _compute_rolling_features_raw(df)
+
+
 # ---------------------------------------------------------------------------
 # Stint filtering (spec Task 1)
 # ---------------------------------------------------------------------------
@@ -209,14 +312,15 @@ def filter_stints(df: pl.DataFrame, sc_laps: pl.DataFrame) -> pl.DataFrame:
         (pl.col("_valid_laps") / pl.len().over(STINT_KEYS)).alias("_valid_frac"))
 
     # SC/VSC-affected lap flag (join on season/gp/session/lap)
-    sc = sc_laps.with_columns(pl.lit(True).alias("_is_sc"))
+    sc = sc_laps.filter(pl.col("lap").is_not_null()).with_columns(
+        pl.lit(1).cast(pl.Int32).alias("is_sc_lap"))
     df = df.join(sc, on=["season", "gp", "session", "lap"], how="left")
-    df = df.with_columns(pl.col("_is_sc").fill_null(False))
+    df = df.with_columns(pl.col("is_sc_lap").fill_null(0))
 
     # stint ends under SC/VSC: any of last 2 laps (by life) affected
     df = df.with_columns(
         ((pl.col("life") >= pl.col("life").max().over(STINT_KEYS) - 1)
-         & pl.col("_is_sc")).any().over(STINT_KEYS).alias("_sc_end"))
+         & (pl.col("is_sc_lap") == 1)).any().over(STINT_KEYS).alias("_sc_end"))
 
     rain = (pl.col("rain_flag").first().over(STINT_KEYS).fill_null(0) > 0)
     keep = (
@@ -228,7 +332,8 @@ def filter_stints(df: pl.DataFrame, sc_laps: pl.DataFrame) -> pl.DataFrame:
     df = df.filter(keep)
     # keep only laps with a valid laptime (labels need fuel_corr)
     df = df.filter(pl.col("laptime").is_not_null())
-    df = df.drop(["_valid_laps", "_valid_frac", "_is_sc", "_sc_end"])
+    # Option B (Task 8.1.2): Retain is_sc_lap as an explicit feature in X
+    df = df.drop(["_valid_laps", "_valid_frac", "_sc_end"])
     n1 = df.height
     nst0, nst1 = n0, n1
     print(f"   stint filtering: {n0:,} -> {n1:,} laps "
@@ -241,20 +346,46 @@ def filter_stints(df: pl.DataFrame, sc_laps: pl.DataFrame) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 def compute_labels(df: pl.DataFrame) -> pl.DataFrame:
     df = df.sort(STINT_KEYS + ["life"])
+    has_sc = "is_sc_lap" in df.columns
     # stint best fuel-corrected pace (LABEL-side only — uses future, allowed)
-    df = df.with_columns(
-        pl.col("fuel_corr").min().over(STINT_KEYS).alias("stint_best_pace"))
+    # Option B: derive stint best pace strictly from non-SC racing laps
+    if has_sc:
+        df = df.with_columns(
+            pl.when(pl.col("is_sc_lap") == 0)
+            .then(pl.col("fuel_corr"))
+            .otherwise(None)
+            .min()
+            .over(STINT_KEYS)
+            .alias("stint_best_pace"))
+        df = df.with_columns(
+            pl.col("stint_best_pace").fill_null(
+                pl.col("fuel_corr").min().over(STINT_KEYS)))
+    else:
+        df = df.with_columns(
+            pl.col("fuel_corr").min().over(STINT_KEYS).alias("stint_best_pace"))
+
     # position within stint (0-based, by life order) — out-lap/standing-start = 0
     df = df.with_columns(
         pl.int_range(pl.len()).over(STINT_KEYS).alias("_pos"))
+
     # T_end: first lap (from stint position 2 = 3rd lap onward, so the out-lap
     # cannot trigger it) where the out-lap-robust rolling median of fuel-
     # corrected pace exceeds the stint best pace + CLIFF_THR, SUSTAINED for
     # 3 consecutive laps (immune to single traffic laps / in-laps).
-    df = df.with_columns(
-        ((pl.col("pace_roll_med_3") > pl.col("stint_best_pace") + CLIFF_THR)
-         & (pl.col("_pos") >= 2))
-        .alias("_above"))
+    # Option B mask: an SC lap cannot trigger _above or contribute to a false cliff!
+    if has_sc:
+        above_expr = (
+            (pl.col("pace_roll_med_3") > pl.col("stint_best_pace") + CLIFF_THR)
+            & (pl.col("_pos") >= 2)
+            & (pl.col("is_sc_lap") == 0)
+        )
+    else:
+        above_expr = (
+            (pl.col("pace_roll_med_3") > pl.col("stint_best_pace") + CLIFF_THR)
+            & (pl.col("_pos") >= 2)
+        )
+    df = df.with_columns(above_expr.alias("_above"))
+
     df = df.with_columns(
         (pl.col("_above")
          & pl.col("_above").shift(-1).over(STINT_KEYS).fill_null(False)

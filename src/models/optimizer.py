@@ -19,12 +19,14 @@ CLI:
     python -m src.models.optimizer                       # demo: 2025 Bahrain VER
     python -m src.models.optimizer --gp "Spanish Grand Prix" --driver HAM --lap 20
     python -m src.models.optimizer --n-sims 1000 --pit-loss 21
+    python -m src.models.optimizer --sc-hazard --pit-loss-sc 7
 """
 from __future__ import annotations
 
 import argparse
 import json
 import time
+from typing import cast
 
 import numpy as np
 import polars as pl
@@ -32,9 +34,11 @@ import polars as pl
 from src.ingest.config import ROOT
 from src.models.eval_rul import build_labeled_frame
 from src.models.rul_data import STINT_KEYS
+from src.models.style_data import WET_COMPOUNDS
 
 MODELS_DIR = ROOT / "data" / "models"
 DRY = ["SOFT", "MEDIUM", "HARD"]
+COMPOUNDS = DRY + WET_COMPOUNDS
 
 SCENARIOS = {
     "clean_air": {"beta_mult": 1.00, "pace_pen": 0.00},
@@ -47,7 +51,7 @@ SCENARIOS = {
 PACE_PEN = {"clean_air": 0.00, "drs_train": 0.25, "backmarker": 0.50}
 
 
-def load_scenarios(params):
+def load_scenarios(params, include_sc=False, pit_loss_sc=None, circuit=None):
     """Merge empirically fitted scenario_beta_mult (if present) with the
     hand-set traffic pace penalty, yielding the runtime scenario table."""
     fitted = params.get("scenario_beta_mult", {})
@@ -55,8 +59,23 @@ def load_scenarios(params):
     for sname, pen in PACE_PEN.items():
         mult = float(fitted.get(sname, SCENARIOS[sname]["beta_mult"]))
         scenarios[sname] = {"beta_mult": mult, "pace_pen": pen}
+    if include_sc:
+        hazard_cfg = params.get("sc_hazard", {})
+        if circuit is not None:
+            hazard_cfg = {
+                **hazard_cfg,
+                "lap_hazard": hazard_cfg.get("lap_hazard", {}).get(circuit, {}),
+            }
+        scenarios["sc_hazard"] = {
+            "beta_mult": 1.0,
+            "pace_pen": 0.0,
+            "pit_loss_sc": (float(pit_loss_sc) if pit_loss_sc is not None
+                             else PIT_LOSS / 3.0),
+            "sc_hazard": hazard_cfg,
+        }
     return scenarios
 PIT_LOSS = 21.0          # s lost per stop (circuit-dependent; CLI flag)
+PIT_LOSS_SC = PIT_LOSS / 3.0  # discounted loss when stopping under SC/VSC
 NEW_STINT_WARMUP = 2.0   # s lump per stop (pit exit + tyre warm-up)
 CLIFF_BETA_MULT = 3.0    # degradation accelerates 3x after the cliff
 JOINT_RUL_LIMIT = 15     # cliff alert + RUL > this => anomaly, no pit
@@ -216,6 +235,31 @@ def _sample_beta(rng, mu, sigma, n):
     return np.clip(rng.normal(mu, sigma, n), lo, hi)
 
 
+def _sample_sc_windows(rng, hazard_cfg, n_sims, n_laps):
+    """Sample one SC/VSC window per simulation using conditional lap hazards."""
+    starts = np.full(n_sims, np.inf)
+    hazard = hazard_cfg.get("lap_hazard", {})
+    for lap in range(1, n_laps + 1):
+        active = np.isinf(starts)
+        p = float(hazard.get(str(lap), 0.0))
+        if p > 0.0 and active.any():
+            hit = active & (rng.random(n_sims) < p)
+            starts[hit] = lap
+    durations = np.ones(n_sims, dtype=float)
+    choices = np.asarray(hazard_cfg.get("duration_laps", [1]), dtype=int)
+    finite = np.isfinite(starts)
+    if finite.any():
+        durations[finite] = choices[rng.integers(0, len(choices), finite.sum())]
+    return starts, durations
+
+
+def _stop_is_under_sc(stop_laps, starts, durations):
+    """Return a boolean matrix: simulation x stop, inclusive lap windows."""
+    stops = np.asarray(stop_laps, dtype=float)
+    return ((stops[None, :] >= starts[:, None])
+            & (stops[None, :] < starts[:, None] + durations[:, None]))
+
+
 def stint_time(base, pen, beta, L, cliff_rem, jump, slope):
     """Vectorized total seconds for one stint of L laps.
 
@@ -230,7 +274,7 @@ def stint_time(base, pen, beta, L, cliff_rem, jump, slope):
     return L * (base + pen) + deg + cliff_cost
 
 
-def simulate(strategy, state, params, scen, n_sims, rng):
+def simulate(strategy, state, params, scen, n_sims, rng, sc_windows=None):
     """Returns (n_sims,) total seconds for the remaining race."""
     totals = np.zeros(n_sims)
     jump = params.get("cliff_jump", 1.5)
@@ -244,27 +288,43 @@ def simulate(strategy, state, params, scen, n_sims, rng):
             continue
         if is_current:
             base = state["base_pace"]
-            beta_mu = (params["beta"][comp]
+            beta_mu = (params.get("beta", {}).get(comp,
+                                                   params.get("beta_global", 0.05))
                        + params["cluster_offset"].get(str(state["cluster"]), 0.0)
                        + params["temp_coef"] * (state["temp"] - params["temp_mean"]))
-            beta = _sample_beta(rng, beta_mu, params["sigma"][comp], n_sims)
-            cliff_rem = _sample_cliff(rng, params["cliff"][comp], n_sims) \
+            sigma = params.get("sigma", {}).get(comp, 0.05)
+            cliff_cfg = params.get("cliff", {}).get(
+                comp, {"censor_prob": 1.0, "quantiles": [20.0]})
+            beta = _sample_beta(rng, beta_mu, sigma, n_sims)
+            cliff_rem = _sample_cliff(rng, cliff_cfg, n_sims) \
                 - state["laps_into_stint"]
             if state["in_cliff_now"]:
                 cliff_rem = np.minimum(cliff_rem, -1.0)
         else:
+            pace_offset = params.get("pace_offset", {})
             base = (state["base_pace"]
-                    + params["pace_offset"][comp]
-                    - params["pace_offset"][state["compound"]])
-            beta_mu = (params["beta"][comp]
+                + pace_offset.get(comp, 0.0)
+                - pace_offset.get(state["compound"], 0.0))
+            beta_mu = (params.get("beta", {}).get(comp,
+                                                   params.get("beta_global", 0.05))
                        + params["cluster_offset"].get(str(state["cluster"]), 0.0)
                        + params["temp_coef"] * (state["temp"] - params["temp_mean"]))
-            beta = _sample_beta(rng, beta_mu, params["sigma"][comp], n_sims)
-            cliff_rem = _sample_cliff(rng, params["cliff"][comp], n_sims)
+            sigma = params.get("sigma", {}).get(comp, 0.05)
+            cliff_cfg = params.get("cliff", {}).get(
+                comp, {"censor_prob": 1.0, "quantiles": [20.0]})
+            beta = _sample_beta(rng, beta_mu, sigma, n_sims)
+            cliff_rem = _sample_cliff(rng, cliff_cfg, n_sims)
         beta = beta * scen["beta_mult"]
         totals += stint_time(base, scen_pen, beta, L, cliff_rem, jump, slope)
-    n_stops = sum(1 for c, e, cur in strategy if not cur and e > state["cur_lap"])
-    totals += n_stops * (PIT_LOSS + NEW_STINT_WARMUP)
+    stop_laps = [e for c, e, cur in strategy
+                 if not cur and e > state["cur_lap"]]
+    if stop_laps and sc_windows is not None:
+        under_sc = _stop_is_under_sc(stop_laps, *sc_windows)
+        pit_loss_sc = float(scen.get("pit_loss_sc", PIT_LOSS_SC))
+        totals += np.where(under_sc, pit_loss_sc, PIT_LOSS).sum(axis=1)
+        totals += len(stop_laps) * NEW_STINT_WARMUP
+    else:
+        totals += len(stop_laps) * (PIT_LOSS + NEW_STINT_WARMUP)
     return totals
 
 
@@ -274,14 +334,14 @@ def enumerate_strategies(state):
     used = set(state["compounds_used"])
     out = [[(state["compound"], n, True)]]
     for p1 in range(cur + 2, n - 2, 2):
-        for c1 in DRY:
+        for c1 in COMPOUNDS:
             if len(used | {c1}) < 2 and n - p1 > 3:
                 continue
             out.append([(state["compound"], p1, True), (c1, n, False)])
     for p1 in range(cur + 3, n - 10, 4):
         for p2 in range(p1 + 6, n - 2, 4):
-            for c1 in DRY:
-                for c2 in DRY:
+            for c1 in COMPOUNDS:
+                for c2 in COMPOUNDS:
                     if len(used | {c1, c2}) < 2:
                         continue
                     out.append([(state["compound"], p1, True),
@@ -297,9 +357,14 @@ def optimize(state, params, n_sims, scenarios):
     results = {}
     cands = enumerate_strategies(state)
     for sname, scen in scenarios.items():
+        sc_windows = scen.get("_sc_windows")
+        if sc_windows is None and scen.get("sc_hazard"):
+            sc_windows = _sample_sc_windows(
+                rng, scen["sc_hazard"], n_sims, state["n_laps"])
         rows = []
         for strat in cands:
-            tot = simulate(strat, state, params, scen, n_sims, rng)
+            tot = simulate(strat, state, params, scen, n_sims, rng,
+                           sc_windows=sc_windows)
             desc = " | ".join(
                 f"{c}->{e}" for c, e, cur in strat)
             rows.append({
@@ -316,6 +381,188 @@ def optimize(state, params, n_sims, scenarios):
             r["delta_vs_best"] = r["mean"] - best
         results[sname] = rows
     return results
+
+
+def branch_point_summary(results):
+    """Summarize the green-flag and SC/VSC branches from ranked results."""
+    green = results.get("clean_air", [])
+    sc = results.get("sc_hazard", [])
+    if not green or not sc:
+        return None
+    green_best = green[0]
+    sc_best = sc[0]
+    return {
+        "green_flag": {"strategy": green_best["strategy"],
+                       "mean": green_best["mean"],
+                       "p5": green_best["p5"], "p95": green_best["p95"]},
+        "sc_window": {"strategy": sc_best["strategy"],
+                      "mean": sc_best["mean"],
+                      "p5": sc_best["p5"], "p95": sc_best["p95"]},
+        "sc_minus_green_mean": sc_best["mean"] - green_best["mean"],
+    }
+
+
+def _practice_session_order(session):
+    """Prefer FP2, then the latest available practice session."""
+    name = str(session).lower()
+    if name == "practice 2":
+        return 0
+    if name.startswith("practice"):
+        return 1
+    return 2
+
+
+def get_prerace_state(season, gp, driver, starting_compound):
+    """Build a lap-zero state from the driver's longest practice stints."""
+    if starting_compound not in COMPOUNDS:
+        raise ValueError(f"unsupported starting compound: {starting_compound}")
+    from src.models.rul_data import load_lap_features
+
+    df = load_lap_features().with_columns(pl.col("season").cast(pl.Utf8))
+    sub = df.filter(
+        (pl.col("season") == str(season)) & (pl.col("gp") == gp)
+        & (pl.col("driver") == driver)
+        & pl.col("session").str.to_lowercase().str.starts_with("practice")
+        & pl.col("compound").is_in(COMPOUNDS))
+    if sub.height == 0:
+        raise SystemExit(f"no practice data for {season} {gp} {driver}")
+    session = sorted(sub["session"].unique().to_list(),
+                     key=_practice_session_order)[0]
+    sub = sub.filter(pl.col("session") == session)
+    all_sub = df.filter(
+        (pl.col("season") == str(season)) & (pl.col("gp") == gp)
+        & (pl.col("session") == session)
+        & pl.col("compound").is_in(COMPOUNDS))
+    stints = (sub.group_by(["stint", "compound"])
+              .agg(pl.len().alias("length"))
+              .sort("length", descending=True))
+    pace_rows = {}
+    pace_sources = []
+    for compound in COMPOUNDS:
+        candidates = stints.filter(pl.col("compound") == compound)
+        source = sub
+        if candidates.height == 0:
+            source = all_sub
+            candidates = (source.group_by(["driver", "stint", "compound"])
+                          .agg(pl.len().alias("length"))
+                          .filter(pl.col("compound") == compound)
+                          .sort("length", descending=True))
+        if candidates.height == 0:
+            continue
+        stint = candidates["stint"][0]
+        filters = [(pl.col("stint") == stint),
+                   (pl.col("compound") == compound)]
+        if "driver" in candidates.columns and source is all_sub:
+            filters.append(pl.col("driver") == candidates["driver"][0])
+        values = source.filter(filters[0] & filters[1] & filters[2]
+                               if len(filters) == 3
+                               else filters[0] & filters[1])["laptime"]
+        values = values.drop_nulls()
+        if values.len():
+            median = values.median()
+            if median is None:
+                continue
+            pace_rows[compound] = float(cast(float, median))
+            pace_sources.append("driver" if source is sub else "field")
+    if starting_compound not in pace_rows:
+        raise SystemExit(f"no {starting_compound} practice stint for "
+                         f"{season} {gp} {driver}")
+    race = df.filter((pl.col("season") == str(season))
+                     & (pl.col("gp") == gp) & (pl.col("session") == "Race"))
+    if race.height == 0:
+        raise SystemExit(f"no race distance for {season} {gp}")
+    max_lap = race["lap"].max()
+    if max_lap is None:
+        raise SystemExit(f"race has no lap numbers for {season} {gp}")
+    n_laps = int(cast(int, max_lap))
+    temp_col = "track_temp_mean" if "track_temp_mean" in sub.columns else None
+    temp = 36.0
+    if temp_col:
+        median_temp = sub[temp_col].median()
+        if median_temp is not None:
+            temp = float(cast(float, median_temp))
+    cluster = -1
+    embeddings = ROOT / "data" / "gold" / "driver_embeddings.parquet"
+    if embeddings.exists():
+        emb = pl.read_parquet(embeddings).with_columns(
+            pl.col("season").cast(pl.Utf8))
+        match = emb.filter((pl.col("season") == str(season))
+                           & (pl.col("driver") == driver))
+        if match.height and "cluster" in match.columns:
+            cluster = int(match["cluster"][0])
+    return {
+        "season": str(season), "gp": gp, "session": "Race",
+        "driver": driver, "cur_lap": 0, "n_laps": n_laps,
+        "compound": starting_compound, "stint": 1, "laps_into_stint": 0,
+        "base_pace": pace_rows[starting_compound], "in_cliff_now": False,
+        "temp": temp, "cluster": cluster,
+        "compounds_used": [starting_compound],
+        "pace_source": f"{session} longest stints (median laptime; "
+                   f"{', '.join(pace_sources)})",
+        "practice_pace": pace_rows,
+    }
+
+
+def parse_strategy(text, state):
+    """Parse ``COMPOUND->lap`` segments into simulate() tuples."""
+    if not text or not text.strip():
+        raise ValueError("strategy cannot be empty")
+    result = []
+    previous = state["cur_lap"]
+    for index, raw in enumerate(text.split(",")):
+        parts = raw.strip().upper().split("->")
+        if len(parts) != 2 or parts[0] not in COMPOUNDS:
+            raise ValueError(f"invalid strategy segment: {raw.strip()}")
+        end = state["n_laps"] if parts[1].strip() == "END" else None
+        if end is None:
+            try:
+                end = int(parts[1].strip())
+            except ValueError as exc:
+                raise ValueError(f"invalid end lap: {parts[1].strip()}") from exc
+        if end <= previous or end > state["n_laps"]:
+            raise ValueError(f"stint ends must increase between {state['cur_lap']} "
+                             f"and {state['n_laps']}: {end}")
+        result.append((parts[0], end, index == 0))
+        previous = end
+    if result[-1][1] != state["n_laps"]:
+        raise ValueError("strategy must end at race distance (use ->end)")
+    if result[0][0] != state["compound"]:
+        raise ValueError("first segment must use the current compound")
+    return result
+
+
+def compare_strategies(strategy_a, strategy_b, state, params, scen,
+                       n_sims, seed=42, sc_windows=None):
+    """Evaluate two strategies with common random numbers."""
+    totals = []
+    for strategy in (strategy_a, strategy_b):
+        totals.append(simulate(strategy, state, params, scen, n_sims,
+                               np.random.default_rng(seed),
+                               sc_windows=sc_windows))
+    a, b = totals
+    delta = a - b
+    return {
+        "a": a, "b": b, "delta": delta,
+        "mean_delta": float(delta.mean()),
+        "p5_delta": float(np.quantile(delta, 0.05)),
+        "p95_delta": float(np.quantile(delta, 0.95)),
+        "a_win_probability": float((delta < 0).mean()),
+    }
+
+
+def degradation_profile(strategy, state, params, scen):
+    """Return the fitted degradation slope and lap count for each stint."""
+    profile = []
+    previous = state["cur_lap"]
+    for compound, end_lap, is_current in strategy:
+        laps = end_lap - previous
+        beta = (params["beta"][compound]
+                + params["cluster_offset"].get(str(state["cluster"]), 0.0)
+                + params["temp_coef"] * (state["temp"] - params["temp_mean"]))
+        profile.append({"compound": compound, "laps": laps,
+                        "beta_per_lap": float(beta * scen["beta_mult"])})
+        previous = end_lap
+    return profile
 
 
 # ---------------------------------------------------------------------------
@@ -406,33 +653,48 @@ def get_state(df, season, gp, session, driver, lap, lapf=None):
 
 
 def main():
-    global PIT_LOSS
+    global PIT_LOSS, PIT_LOSS_SC
     ap = argparse.ArgumentParser()
     ap.add_argument("--gp", default="Bahrain Grand Prix")
     ap.add_argument("--driver", default="VER")
     ap.add_argument("--season", default="2025")
     ap.add_argument("--lap", type=int, default=12)
+    ap.add_argument("--pre-race", action="store_true",
+                    help="seed lap-zero state from the driver's practice data")
+    ap.add_argument("--starting-compound", choices=COMPOUNDS, default="MEDIUM")
+    ap.add_argument("--compare", nargs=2, metavar=("STRATEGY_A", "STRATEGY_B"),
+                    help="compare two plans, e.g. SOFT->18,MEDIUM->end")
     ap.add_argument("--n-sims", type=int, default=400)
     ap.add_argument("--pit-loss", type=float, default=PIT_LOSS)
+    ap.add_argument("--sc-hazard", action="store_true",
+                    help="enable empirical SC/VSC hazard Monte Carlo scenario")
+    ap.add_argument("--pit-loss-sc", type=float, default=None,
+                    help="pit loss under SC/VSC (default: pit-loss / 3)")
     args = ap.parse_args()
     PIT_LOSS = args.pit_loss
+    PIT_LOSS_SC = (args.pit_loss_sc if args.pit_loss_sc is not None
+                   else args.pit_loss / 3.0)
     t0 = time.time()
 
     with open(MODELS_DIR / "degradation_model.json") as fh:
         params = json.load(fh)
-    meta, rul_m, cliff_x, cliff_l, thr, weights, lstm_m = load_phase4()
-
-    print("[opt] building labeled frame...")
-    df = build_labeled_frame()
-    emb = pl.read_parquet(ROOT / "data" / "gold" / "driver_embeddings.parquet")
-    emb = emb.with_columns(pl.col("season").cast(pl.Utf8))
-    df = df.join(emb.select(["season", "driver", "cluster"]),
-                 on=["season", "driver"], how="left")
-    df = df.with_columns(pl.col("cluster").fill_null(-1).cast(pl.Int32))
-
-    state = get_state(df, args.season, args.gp, "Race", args.driver, args.lap,
-                      lapf=pl.read_parquet(ROOT / "data" / "gold"
-                                           / "lap_features.parquet"))
+    if args.pre_race:
+        state = get_prerace_state(args.season, args.gp, args.driver,
+                                  args.starting_compound)
+        df = None
+        meta = rul_m = cliff_x = cliff_l = thr = weights = lstm_m = None
+    else:
+        meta, rul_m, cliff_x, cliff_l, thr, weights, lstm_m = load_phase4()
+        print("[opt] building labeled frame...")
+        df = build_labeled_frame()
+        emb = pl.read_parquet(ROOT / "data" / "gold" / "driver_embeddings.parquet")
+        emb = emb.with_columns(pl.col("season").cast(pl.Utf8))
+        df = df.join(emb.select(["season", "driver", "cluster"]),
+                     on=["season", "driver"], how="left")
+        df = df.with_columns(pl.col("cluster").fill_null(-1).cast(pl.Int32))
+        state = get_state(df, args.season, args.gp, "Race", args.driver, args.lap,
+                          lapf=pl.read_parquet(ROOT / "data" / "gold"
+                                               / "lap_features.parquet"))
     print(f"\n[state] {args.season} {args.gp} Race | {args.driver} @ lap "
           f"{state['cur_lap']}/{state['n_laps']}")
     print(f"        stint {state['stint']} on {state['compound']} "
@@ -440,7 +702,29 @@ def main():
     print(f"        track {state['temp']:.1f}C, style cluster {state['cluster']}, "
           f"compounds used so far: {state['compounds_used']}")
 
-    scenarios = load_scenarios(params)
+    scenarios = load_scenarios(params, include_sc=args.sc_hazard,
+                               pit_loss_sc=args.pit_loss_sc,
+                               circuit=state["gp"])
+    if args.compare:
+        strategy_a = parse_strategy(args.compare[0], state)
+        strategy_b = parse_strategy(args.compare[1], state)
+        paired = compare_strategies(strategy_a, strategy_b, state, params,
+                                    scenarios["clean_air"], args.n_sims)
+        print("\n[compare] A vs B (positive delta means A is slower)")
+        print(f"  A: {args.compare[0]}")
+        print(f"  B: {args.compare[1]}")
+        print(f"  delta A-B: {paired['mean_delta']:+.2f}s "
+              f"(90% interval {paired['p5_delta']:+.2f}.."
+              f"{paired['p95_delta']:+.2f}s)")
+        print(f"  P(A faster): {paired['a_win_probability']:.1%}")
+        for label, strategy in (("A", strategy_a), ("B", strategy_b)):
+            profile = degradation_profile(strategy, state,
+                                          params, scenarios["clean_air"])
+            values = ", ".join(f"{p['compound']} {p['laps']} laps "
+                               f"(beta {p['beta_per_lap']:.3f})"
+                               for p in profile)
+            print(f"  profile {label}: {values}")
+        return
     results = optimize(state, params, args.n_sims, scenarios)
     for sname, rows in results.items():
         print(f"\n[strategy] scenario: {sname} "
@@ -453,7 +737,24 @@ def main():
                   f"{r['std']:6.1f} {r['p5']:8.1f} {r['p95']:8.1f} "
                   f"{r['delta_vs_best']:+9.1f}")
 
+    if args.pre_race and args.sc_hazard:
+        branch = branch_point_summary(results)
+        if branch is not None:
+            green = branch["green_flag"]
+            sc = branch["sc_window"]
+            print("\n[branch] pre-race decision point")
+            print(f"  green flag : {green['strategy']} | {green['mean']:.1f}s "
+                  f"(p5-p95 {green['p5']:.1f}-{green['p95']:.1f})")
+            print(f"  SC/VSC     : {sc['strategy']} | {sc['mean']:.1f}s "
+                  f"(p5-p95 {sc['p5']:.1f}-{sc['p95']:.1f})")
+            print(f"  SC - green : {branch['sc_minus_green_mean']:+.1f}s")
+
+    if args.pre_race:
+        print(f"        pace source: {state['pace_source']}")
+        return
+
     # monitor backtest on the same driver's actual race stints
+    assert df is not None
     drv_df = df.filter((pl.col("season") == args.season)
                        & (pl.col("gp") == args.gp)
                        & (pl.col("session") == "Race")
