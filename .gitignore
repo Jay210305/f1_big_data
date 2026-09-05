@@ -28,7 +28,6 @@ __pycache__/
 htmlcov/
 
 # ===== Local planning annotations (stop-n-go phase notes, local-only) =====
-annotations/
 data/
 src/__pycache__/
 notebooks/.ipynb_checkpoints/

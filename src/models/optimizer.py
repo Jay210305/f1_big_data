@@ -41,6 +41,21 @@ SCENARIOS = {
     "drs_train": {"beta_mult": 1.15, "pace_pen": 0.25},
     "backmarker": {"beta_mult": 1.25, "pace_pen": 0.50},
 }
+# traffic pace penalty (s/lap) per scenario — separate from degradation slope;
+# the beta multipliers are now fitted empirically (Task 8.0.4 Option A) and
+# overridden by load_scenarios() from degradation_model.json.
+PACE_PEN = {"clean_air": 0.00, "drs_train": 0.25, "backmarker": 0.50}
+
+
+def load_scenarios(params):
+    """Merge empirically fitted scenario_beta_mult (if present) with the
+    hand-set traffic pace penalty, yielding the runtime scenario table."""
+    fitted = params.get("scenario_beta_mult", {})
+    scenarios = {}
+    for sname, pen in PACE_PEN.items():
+        mult = float(fitted.get(sname, SCENARIOS[sname]["beta_mult"]))
+        scenarios[sname] = {"beta_mult": mult, "pace_pen": pen}
+    return scenarios
 PIT_LOSS = 21.0          # s lost per stop (circuit-dependent; CLI flag)
 NEW_STINT_WARMUP = 2.0   # s lump per stop (pit exit + tyre warm-up)
 CLIFF_BETA_MULT = 3.0    # degradation accelerates 3x after the cliff
@@ -425,11 +440,12 @@ def main():
     print(f"        track {state['temp']:.1f}C, style cluster {state['cluster']}, "
           f"compounds used so far: {state['compounds_used']}")
 
-    results = optimize(state, params, args.n_sims, SCENARIOS)
+    scenarios = load_scenarios(params)
+    results = optimize(state, params, args.n_sims, scenarios)
     for sname, rows in results.items():
         print(f"\n[strategy] scenario: {sname} "
-          f"(beta x{SCENARIOS[sname]['beta_mult']}, "
-          f"pace +{SCENARIOS[sname]['pace_pen']}s/lap)")
+          f"(beta x{scenarios[sname]['beta_mult']}, "
+          f"pace +{scenarios[sname]['pace_pen']}s/lap)")
         print(f"  {'strategy':32s} {'stops':>5s} {'mean':>8s} {'std':>6s} "
               f"{'p5':>8s} {'p95':>8s} {'dvs best':>9s}")
         for r in rows[:6]:

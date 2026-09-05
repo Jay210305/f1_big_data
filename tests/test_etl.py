@@ -54,3 +54,50 @@ def test_record_error_structured():
     assert stats["error_log"][0]["type"] == "ValueError"
     assert stats["error_log"][0]["message"] == "boom"
     assert stats["error_log"][0]["stage"] == "load_telemetry"
+
+
+def test_silver_exprs_aggregations():
+    """`_silver_exprs` must emit partition literals, n_samples, and the
+    speed/throttle/brake/drs/acc/dirty-air aggregations with correct dtypes."""
+    meta = {"season": "2025", "gp": "T", "session": "Race",
+            "driver": "VER", "lap": 3}
+    exprs = E._silver_exprs(["speed", "throttle", "brake", "drs",
+                             "DistanceToDriverAhead"], meta)
+    df = pl.DataFrame({
+        "speed": [250.0, 260.0], "throttle": [0.5, 1.0],
+        "brake": [0.0, 1.0], "drs": [0.0, 1.0],
+        "DistanceToDriverAhead": [5.0, 50.0],
+    }).select(exprs)
+    assert df["speed_mean"][0] == 255.0
+    assert df["speed_max"][0] == 260.0
+    assert df["speed_min"][0] == 250.0
+    assert df["throttle_active_frac"][0] == 1.0
+    assert df["brake_frac"][0] == 0.5
+    assert df["drs_frac"][0] == 0.5
+    assert df["dirty_air_frac"][0] == 0.5  # one lap within 10 m
+    assert df["n_samples"][0] == 2
+    assert df["lap"][0] == 3
+
+
+def test_silver_exprs_missing_channels_null():
+    """Channels absent from the input must render as NULL-typed (not drop)."""
+    meta = {"season": "2025", "gp": "T", "session": "Race",
+            "driver": "VER", "lap": 3}
+    exprs = E._silver_exprs(["speed"], meta)
+    df = pl.DataFrame({"speed": [250.0]}).select(exprs)
+    assert df["speed_mean"][0] == 250.0
+    # throttle/drs channels absent -> null columns still present
+    assert "throttle_mean" in df.columns
+    assert df["throttle_mean"][0] is None
+    assert "dirty_air_frac" in df.columns
+
+
+def test_normalize_telemetry_truncates_to_min_length():
+    """Ragged arrays are truncated to the shortest list (spec: min_len)."""
+    inner = {"speed": [1.0, 2.0], "rpm": [10, 20, 30]}  # rpm longer
+    meta = {"season": "2025", "gp": "Test", "session": "Race",
+            "driver": "VER", "lap": 1}
+    df = E._normalize_telemetry(inner, meta)
+    assert df.height == 2  # truncated to len(speed)
+    assert df["rpm"].to_list() == [10.0, 20.0]
+    assert df["speed"].dtype == pl.Float64
