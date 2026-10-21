@@ -188,3 +188,44 @@ def test_mid_stint_sc_does_not_trigger_false_cliff():
     assert df["t_end_life"][0] is None
     assert not any(df["cliff_within_3"])
 
+
+def test_out_lap_does_not_pollute_stint_baseline_delta():
+    """Verify that lap 1 out-lap/standing start does not pollute degradation deltas."""
+    df = pl.DataFrame({
+        "season": ["2025"] * 5, "gp": ["T"] * 5, "session": ["Race"] * 5,
+        "driver": ["VER"] * 5, "stint": [1] * 5, "life": list(range(1, 6)),
+        "lap": [1, 2, 3, 4, 5], "compound": ["SOFT"] * 5,
+        # Lap 1 is out-lap (105.0s), Lap 2 is flying baseline (98.0s), Lap 3 degrades (98.5s)
+        "laptime": [105.0, 98.0, 98.5, 99.0, 100.0],
+        "s1": [26.0, 24.5, 24.6, 24.8, 25.0],
+        "s2": [26.0, 24.5, 24.6, 24.8, 25.0],
+        "s3": [26.0, 24.5, 24.6, 24.8, 25.0],
+        "session_type": ["Race"] * 5,
+    })
+    df = add_fuel_corr(df)
+    df = compute_rolling_features(df)
+    # Out-lap (lap 1) must have delta == 0.0 (not negative or contaminated by pit exit/standing start)
+    assert df.filter(pl.col("lap") == 1)["fuel_corr_delta_start"][0] == 0.0
+    assert df.filter(pl.col("lap") == 1)["s1_delta_start"][0] == 0.0
+    # Flying lap 2 is the baseline -> delta == 0.0
+    assert abs(df.filter(pl.col("lap") == 2)["fuel_corr_delta_start"][0]) < 1e-5
+    # Flying lap 3 has true positive degradation
+    assert df.filter(pl.col("lap") == 3)["fuel_corr_delta_start"][0] > 0.0
+
+
+def test_pruned_correlations_excluded_from_features():
+    """Verify that all collinear/spurious variables are stripped from feature_cols."""
+    from src.models.rul_data import PRUNED_CORRELATIONS
+    pruned_sample = {c: [1.0] for c in PRUNED_CORRELATIONS}
+    pruned_sample.update({
+        "season": ["2025"], "gp": ["T"], "session": ["Race"],
+        "lap": [1], "speed_mean": [300.0], "fuel_corr": [100.0],
+    })
+    df = pl.DataFrame(pruned_sample)
+    feats = feature_cols(df)
+    for c in PRUNED_CORRELATIONS:
+        assert c not in feats, f"Pruned feature {c} leaked into feature_cols"
+    assert "speed_mean" in feats
+    assert "fuel_corr" in feats
+
+

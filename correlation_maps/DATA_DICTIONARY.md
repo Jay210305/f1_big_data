@@ -8,8 +8,8 @@ anyone read the heatmaps and feature-vs-target charts without opening the code.
 
 | Figure | Content |
 |--------|---------|
-| `rul_features_corr.png` | Pearson correlation heatmap between **75 numeric features** fed to the Phase 4 RUL / tyre-cliff models (rows × columns). |
-| `rul_target_corr.png` | For each of those 75 features, its correlation with the two model **labels**: `target_rul` (remaining useful life, laps) and `cliff_within_3` (tyre enters the cliff within the next 3 laps). |
+| `rul_features_corr.png` | Pearson correlation heatmap between **50 numeric features** fed to the Phase 4 RUL / tyre-cliff models (rows × columns), pruned of structural multicollinearity, formula duplicates, and circular errors. |
+| `rul_target_corr.png` | For each of those 50 features, its correlation with the two model **labels**: `target_rul` (remaining useful life, laps) and `cliff_within_3` (tyre enters the cliff within the next 3 laps). |
 | `style_features_corr.png` | Pearson correlation heatmap between **42 continuous features** fed to the Phase 5 driving-style autoencoder. |
 
 ### How to read them
@@ -27,13 +27,14 @@ anyone read the heatmaps and feature-vs-target charts without opening the code.
 
 ---
 
-## 2. RUL / cliff model features (75)
+## 2. RUL / cliff model features (50)
 
 All features are **per lap**, one row per lap of a Race or Sprint stint, after
 SC/VSC-truncated and short dry stints are filtered out (see
 `src/models/rul_data.py`). Nominal features (`compound`, `session_type`, `gp`,
-`driver`) and the constant feature `brake_intensity` are excluded from the
-correlation maps.
+`driver`) and constant/spurious features are excluded. Following the mathematical
+and physical audit, structural multicollinearities ($s_2-s_1$, $t - t_0$ with $t_0$,
+overlapping rolling smoothers, raw degrees) were pruned.
 
 ### 2.1 Context / tyre life
 
@@ -42,23 +43,18 @@ correlation maps.
 | `stint` | Stint number within the race (1st, 2nd, … set of tyres). |
 | `life` | Tyre age in laps so far (laps run on the current compound). |
 
-### 2.2 Pace & sector times
+### 2.2 Pace & degradation deltas
 
 | Variable | Description |
 |----------|-------------|
-| `laptime` | Full lap time (s). |
-| `s1`, `s2`, `s3` | Sector 1 / 2 / 3 times (s). |
-| `stint_first_laptime` | First lap time of the stint (reference for degradation). |
-| `laptime_delta_stint_start` | `laptime` − `stint_first_laptime` (pace lost since stint start, s). |
-| `laptime_delta_prev` | `laptime` − previous lap in stint (lap-to-lap change, s). |
-| `sector_decay_21` | `s2 − s1` (sector pace shape). |
-| `sector_decay_32` | `s3 − s2` (sector pace shape). |
+| `laptime_delta_prev` | `laptime` − previous lap in stint (lap-to-lap pace change, s). |
+| `fuel_corr` | `laptime + 0.03·lap` (Race/Sprint) — isolates tyre degradation from fuel-burn pace gain. |
+| `fuel_corr_delta_start` | `fuel_corr` − first flying lap `fuel_corr` of the stint (out-lap excluded; 0 for out-lap). |
 
 ### 2.3 Telemetry statistics (from the high-frequency Bronze samples)
 
 | Variable | Description |
 |----------|-------------|
-| `n_samples` | Number of telemetry samples in the lap. |
 | `speed_mean` / `speed_max` / `speed_min` / `speed_std` | Speed statistics (km/h). |
 | `throttle_mean` / `throttle_std` | Throttle-input statistics. |
 | `throttle_active_frac` | Fraction of lap with throttle > 0. |
@@ -69,16 +65,14 @@ correlation maps.
 | `gear_mean` / `gear_std` | Gear selection statistics. |
 | `rpm_mean` / `rpm_max` | Engine RPM statistics. |
 
-### 2.4 Mechanical stress (tyre load)
+### 2.4 Mechanical stress & tyre energy dissipation
 
 | Variable | Description |
 |----------|-------------|
 | `lat_g_abs_mean` / `lat_g_std` / `lat_g_max` | Absolute lateral acceleration (acc_x) statistics, in g. |
 | `long_g_abs_mean` / `long_g_std` / `long_g_max` | Absolute longitudinal acceleration (acc_y) statistics, in g. |
 | `vert_g_abs_mean` | Mean absolute vertical acceleration (acc_z), in g. |
-| `lat_load_integral` | `Σ|acc_x|·distance` — lateral tyre-load integral. |
-| `long_load_integral` | `Σ|acc_y|·distance` — longitudinal tyre-load integral. |
-| `lat_energy_integral` | `mean(acc_x²·speed)` — lateral tyre-energy rate proxy. |
+| `lat_energy_integral` | `mean(acc_x²·speed)` — lateral frictional energy rate proxy (Grosch/Archard tyre wear). |
 
 ### 2.5 Dirty air / track position
 
@@ -87,46 +81,38 @@ correlation maps.
 | `dirty_air_frac` | Share of lap within 10 m of the car ahead. |
 | `dirty_air_mean_dist` | Average distance to the car ahead (m). |
 | `dirty_air_p10_dist` | 10th percentile of distance to the car ahead (m). |
-| `lap_distance` | Lap length from telemetry (m). |
 
-### 2.6 Environmental (session weather)
+### 2.6 Environmental (session weather & circular directional statistics)
 
 | Variable | Description |
 |----------|-------------|
-| `ambient_temp_mean` / `ambient_temp_max` | Ambient air temperature (°C). |
-| `track_temp_mean` / `track_temp_max` / `track_temp_std` | Track temperature (°C). |
-| `track_temp_range` | `track_temp_max − track_temp_mean` (°C). |
+| `ambient_temp_mean` | Ambient air temperature (°C). |
+| `track_temp_mean` / `track_temp_std` | Track temperature level and thermal fluctuation (°C). |
 | `rain_flag` | Whether rain was recorded in the session (0/1). |
 | `wind_speed_mean` | Mean wind speed (weather channel). |
-| `wind_dir_mean` | Mean wind direction (weather channel). |
-| `weather_samples` | Number of weather observations in the session. |
+| `wind_dir_sin`, `wind_dir_cos` | Circular unit components on $S^1$ ($\sin \theta, \cos \theta$) — resolves $0^\circ \equiv 360^\circ$ branch cut. |
 
-### 2.7 Fuel correction & rolling pace (causal windows, no future leakage)
+### 2.7 Causal rolling pace & trend features (decimated filter bank)
 
 | Variable | Description |
 |----------|-------------|
-| `fuel_corr` | `laptime + 0.03·lap` (Race/Sprint) — isolates tyre degradation from fuel-burn pace gain. |
-| `pace_roll_mean_3` / `_5` / `_8` | Rolling mean of `fuel_corr` over 3 / 5 / 8 laps. |
-| `pace_roll_std_3` / `_5` / `_8` | Rolling std of `fuel_corr` over 3 / 5 / 8 laps. |
-| `pace_roll_med_3` | Rolling median of `fuel_corr` over 3 laps (out-lap robust). |
-| `pace_roll_spread_5` | max − min of `fuel_corr` over the last 5 laps (consistency). |
+| `pace_roll_med_3` | Rolling median of `fuel_corr` over 3 laps (out-lap robust; used for physical $T_{\text{end}}$ cliff trigger). |
+| `pace_roll_mean_5` | Smoothed rolling mean of `fuel_corr` over 5 laps. |
+| `pace_roll_std_5` | Rolling standard deviation of `fuel_corr` over 5 laps (pace consistency). |
+| `pace_roll_spread_5` | max − min of `fuel_corr` over the last 5 laps. |
 | `pace_slope_5` | `(fuel_corr − fuel_corrₜ₋₄)/4` — degradation slope (s/lap). |
-| `pace_ema_02` / `pace_ema_05` | Exponential moving average of `fuel_corr` (α = 0.2 / 0.5). |
-| `fuel_corr_delta_start` | `fuel_corr` − first lap `fuel_corr` of the stint. |
-| `pace_best_so_far` | Cumulative minimum of `fuel_corr` (best pace seen so far). |
-| `pace_above_best` | `fuel_corr − pace_best_so_far` — how far above the stint best. |
-| `pace_above_best_roll3` / `_roll5` / `_roll8` | Rolling mean of `pace_above_best` over 3 / 5 / 8 laps. |
-| `pace_above_best_slope5` | Slope of `pace_above_best` over 5 laps (s/lap). |
+| `pace_above_best_roll5` | 5-lap rolling mean of `fuel_corr − pace_best_so_far` — smoothed degradation level relative to stint best. |
+| `pace_above_best_slope5` | Slope of `pace_above_best_roll5` over 5 laps (s/lap) — acceleration towards the cliff. |
+| `is_sc_lap` | Flag for Safety Car / VSC lap. |
 
-### 2.8 Sector deltas (traction-limited wear)
+### 2.8 Clean sector degradation deltas
 
 | Variable | Description |
 |----------|-------------|
-| `s3_s1_gap` | `s3 − s1` (traction-limited S3 vs aero S1 gap). |
-| `s3_delta_start` | `s3` − first `s3` of the stint (S3 degradation). |
-| `s1_delta_start` | `s1` − first `s1` of the stint (S1 degradation). |
-| `s2_delta_start` | `s2` − first `s2` of the stint (S2 degradation). |
-| `s3_delta_roll_5` | Rolling mean of `s3_delta_start` over 5 laps. |
+| `s1_delta_start` | `s1` − first clean flying lap `s1` of the stint. |
+| `s2_delta_start` | `s2` − first clean flying lap `s2` of the stint. |
+| `s3_delta_start` | `s3` − first clean flying lap `s3` of the stint. |
+| `s3_delta_roll_5` | Rolling mean of `s3_delta_start` over 5 laps (traction-limited sector degradation). |
 
 ### 2.9 Labels (targets, shown only in `rul_target_corr.png`)
 

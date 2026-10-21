@@ -50,7 +50,33 @@ CLIFF_DERIVED = {
     "stint_laptime_median", "stint_laptime_p25", "stint_best_pace",
     "rul", "rul_physical", "target_rul", "t_end_life",
 }
-EXCLUDED = IDENTIFIERS | LABELS | CLIFF_DERIVED
+
+# Features pruned to eliminate artificial structural multicollinearity,
+# formula redundancies, spurious proxies, and circular errors.
+PRUNED_CORRELATIONS = {
+    # 1, 4 & 5: Baseline levels and structural identities (t = t0 + delta)
+    "stint_first_laptime", "laptime", "laptime_delta_stint_start",
+    "pace_best_so_far", "pace_above_best",
+    # 2: Sample count (telemetry duration / acquisition proxy, not wear physics)
+    "n_samples", "weather_samples",
+    # 3: Circular angle (replaced by wind_dir_sin and wind_dir_cos)
+    "wind_dir_mean",
+    # 6: Formula differences & raw sector levels
+    "s1", "s2", "s3", "sector_decay_21", "sector_decay_32", "s3_s1_gap",
+    # 7 & 8: Collinear rolling pace windows
+    "pace_roll_mean_3", "pace_roll_std_3", "pace_roll_mean_8", "pace_roll_std_8",
+    "pace_ema_02", "pace_ema_05", "pace_above_best_roll3", "pace_above_best_roll8",
+    # 9: Collinear temperatures (range = max - mean; max has r > 0.97 with mean)
+    "track_temp_max", "ambient_temp_max", "track_temp_range",
+    # 10: Collinear load products (lat_g * lap_distance)
+    "lat_load_integral", "long_load_integral",
+    # 11: Lap distance (circuit identifier leakage into trees)
+    "lap_distance",
+    # Zero-variance constant
+    "brake_intensity",
+}
+
+EXCLUDED = IDENTIFIERS | LABELS | CLIFF_DERIVED | PRUNED_CORRELATIONS
 
 
 def _session_type(name: str) -> str:
@@ -211,13 +237,16 @@ def _compute_rolling_features_raw(df: pl.DataFrame) -> pl.DataFrame:
     df = df.sort(STINT_KEYS + ["life"])
     fc = pl.col("fuel_corr")
 
+    df = df.with_columns(
+        pl.int_range(pl.len()).over(STINT_KEYS).alias("_stint_pos"))
+
     exprs = []
-    for w in (3, 5, 8):
-        exprs.append(fc.rolling_mean(window_size=w, min_samples=1)
-                     .over(STINT_KEYS).alias(f"pace_roll_mean_{w}"))
-        exprs.append(fc.rolling_std(window_size=w, min_samples=2)
-                     .over(STINT_KEYS).fill_null(0.0)
-                     .alias(f"pace_roll_std_{w}"))
+    # 5-lap window for mean and std
+    exprs.append(fc.rolling_mean(window_size=5, min_samples=1)
+                 .over(STINT_KEYS).alias("pace_roll_mean_5"))
+    exprs.append(fc.rolling_std(window_size=5, min_samples=2)
+                 .over(STINT_KEYS).fill_null(0.0)
+                 .alias("pace_roll_std_5"))
     # robust median (out-lap insensitive) — also used for the T_end label rule
     exprs.append(fc.rolling_median(window_size=3, min_samples=1)
                  .over(STINT_KEYS).alias("pace_roll_med_3"))
@@ -229,53 +258,52 @@ def _compute_rolling_features_raw(df: pl.DataFrame) -> pl.DataFrame:
     # degradation slope over last 5 laps (simple linear approx)
     exprs.append(
         ((fc - fc.shift(4).over(STINT_KEYS)) / 4.0).alias("pace_slope_5"))
-    # EMA pace
-    exprs.append(fc.ewm_mean(alpha=0.2).over(STINT_KEYS).alias("pace_ema_02"))
-    exprs.append(fc.ewm_mean(alpha=0.5).over(STINT_KEYS).alias("pace_ema_05"))
-    # fuel-corrected delta vs stint start (causal: first lap is past)
+
+    # Out-lap-aware fuel-corrected baseline (first flying lap with pos >= 1; pos 0 gets 0.0)
+    fc_base = pl.coalesce([
+        pl.when(pl.col("_stint_pos") >= 1).then(fc).drop_nulls().first().over(STINT_KEYS),
+        fc.first().over(STINT_KEYS)
+    ])
     exprs.append(
-        (fc - fc.first().over(STINT_KEYS)).alias("fuel_corr_delta_start"))
-    # causal running-best pace and the degradation gap to it:
-    # pace_best_so_far = cumulative min of fuel-corrected pace (past only);
-    # pace_above_best  = how far above the stint's best-so-far pace we are.
-    # This is the causal analogue of the label's (final) stint_best_pace gap —
-    # telemetry-derived, NOT derived from the cliff flag (spec-compliant).
+        pl.when(pl.col("_stint_pos") == 0)
+        .then(0.0)
+        .otherwise(fc - fc_base)
+        .alias("fuel_corr_delta_start")
+    )
+
+    # Causal running-best pace and the degradation gap to it:
     exprs.append(fc.cum_min().over(STINT_KEYS).alias("pace_best_so_far"))
     df = df.with_columns(exprs)
     df = df.with_columns(
         (pl.col("fuel_corr") - pl.col("pace_best_so_far"))
         .alias("pace_above_best"))
     df = df.with_columns(
-        pl.col("pace_above_best").rolling_mean(window_size=3, min_samples=1)
-        .over(STINT_KEYS).alias("pace_above_best_roll3"))
-    df = df.with_columns([
         pl.col("pace_above_best").rolling_mean(window_size=5, min_samples=1)
-        .over(STINT_KEYS).alias("pace_above_best_roll5"),
-        pl.col("pace_above_best").rolling_mean(window_size=8, min_samples=1)
-        .over(STINT_KEYS).alias("pace_above_best_roll8"),
-    ])
+        .over(STINT_KEYS).alias("pace_above_best_roll5"))
     df = df.with_columns(
-        ((pl.col("pace_above_best")
-          - pl.col("pace_above_best").shift(4).over(STINT_KEYS)) / 4.0)
+        ((pl.col("pace_above_best_roll5")
+          - pl.col("pace_above_best_roll5").shift(4).over(STINT_KEYS)) / 4.0)
         .alias("pace_above_best_slope5"))
-    # sector deltas: traction-limited S3 vs S1, per-sector degradation
+
+    # Sector deltas: per-sector degradation from first flying lap (out-lap aware)
     exprs2 = []
-    exprs2.append((pl.col("s3") - pl.col("s1")).alias("s3_s1_gap"))
-    exprs2.append(
-        (pl.col("s3") - pl.col("s3").first().over(STINT_KEYS))
-        .alias("s3_delta_start"))
-    exprs2.append(
-        (pl.col("s1") - pl.col("s1").first().over(STINT_KEYS))
-        .alias("s1_delta_start"))
-    exprs2.append(
-        (pl.col("s2") - pl.col("s2").first().over(STINT_KEYS))
-        .alias("s2_delta_start"))
+    for s in ("s1", "s2", "s3"):
+        s_base = pl.coalesce([
+            pl.when(pl.col("_stint_pos") >= 1).then(pl.col(s)).drop_nulls().first().over(STINT_KEYS),
+            pl.col(s).first().over(STINT_KEYS)
+        ])
+        exprs2.append(
+            pl.when(pl.col("_stint_pos") == 0)
+            .then(0.0)
+            .otherwise(pl.col(s) - s_base)
+            .alias(f"{s}_delta_start")
+        )
     df = df.with_columns(exprs2)
     # rolling S3 degradation (traction-limited sector wears tyres fastest)
     df = df.with_columns(
         pl.col("s3_delta_start").rolling_mean(window_size=5, min_samples=1)
         .over(STINT_KEYS).alias("s3_delta_roll_5"))
-    return df
+    return df.drop(["_stint_pos"])
 
 
 def compute_rolling_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -493,6 +521,12 @@ def prepare():
     # restrict to the race-strategy domain: practice/qualifying stint semantics
     # (short experimental runs, quali-sim baselines) are strategy noise (spec Task 1)
     df = df.filter(pl.col("session_type").is_in(["Race", "Sprint"]))
+    if "wind_dir_sin" not in df.columns and "wind_dir_mean" in df.columns:
+        rad = pl.col("wind_dir_mean") * (np.pi / 180.0)
+        df = df.with_columns([
+            rad.sin().alias("wind_dir_sin"),
+            rad.cos().alias("wind_dir_cos"),
+        ])
     print(f"[prep] Race/Sprint laps: {df.height:,}")
     print("[prep] loading SC/VSC laps from rcm...")
     sc_laps = load_sc_laps()

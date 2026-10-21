@@ -14,12 +14,13 @@ One row per lap (≈317k rows). Keys: `season, gp, session, driver, lap`.
 | identity | season, gp, session, driver, lap | partition keys | — |
 | stint | stint, life, compound | stint id, tyre age (laps run so far), compound | life OK |
 | pace | laptime, s1, s2, s3 | lap + sector times (s) | OK |
-| degradation | stint_first_laptime | first laptime of the stint (reference) | OK |
-| degradation | laptime_delta_stint_start | laptime − stint first laptime | OK |
+| degradation | stint_first_laptime | first clean flying laptime of the stint (reference, out-lap excluded) | OK |
+| degradation | laptime_delta_stint_start | laptime − stint flying baseline (0 for out-lap) | OK |
 | degradation | laptime_delta_prev | laptime − previous lap in stint | OK |
 | degradation | sector_decay_21, sector_decay_32 | s2−s1, s3−s2 | OK |
-| degradation | cliff_flag | laptime_delta_stint_start > 2.0 s | OK |
-| telemetry | n_samples | telemetry samples in lap | OK |
+| degradation | cliff_flag | laptime_delta_stint_start > 2.0 s on flying laps | OK |
+| telemetry | n_samples | telemetry samples in lap | OK (diagnostic) |
+| telemetry | telemetry_sample_rate_hz | telemetry sampling rate (Hz) | OK |
 | telemetry | speed_mean/max/min/std | speed statistics (km/h) | OK |
 | telemetry | throttle_mean/std | throttle input stats | OK |
 | telemetry | throttle_active_frac | fraction of lap with throttle > 0 | OK |
@@ -34,6 +35,7 @@ One row per lap (≈317k rows). Keys: `season, gp, session, driver, lap`.
 | mechanical stress | vert_g_abs_mean | vertical G (acc_z) mean | OK |
 | mechanical stress | lat_load_integral | ∑|acc_x|·distance — lateral tyre load | OK |
 | mechanical stress | long_load_integral | ∑|acc_y|·distance — longitudinal load | OK |
+| mechanical stress | lat_energy_integral | mean(acc_x²·speed) — lateral tyre-energy rate proxy | OK |
 | dirty air | dirty_air_frac | share of lap within 10 m of car ahead | OK |
 | dirty air | dirty_air_mean_dist | avg distance to car ahead (m) | OK |
 | dirty air | dirty_air_p10_dist | 10th percentile distance to car ahead | OK |
@@ -42,6 +44,7 @@ One row per lap (≈317k rows). Keys: `season, gp, session, driver, lap`.
 | environmental | track_temp_mean/max/std/range | track temp (°C) | OK |
 | environmental | rain_flag | any rain in session | OK |
 | environmental | wind_speed_mean, wind_dir_mean | wind from weather | OK |
+| environmental | wind_dir_sin, wind_dir_cos | circular sin/cos wind components | OK |
 
 ### 2. `driver_style.parquet` — style profile (Model 2)
 

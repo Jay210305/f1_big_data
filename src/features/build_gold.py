@@ -118,6 +118,8 @@ def compute_environmental(years: list[str]) -> pl.DataFrame:
                max(CASE WHEN wR THEN 1 ELSE 0 END) AS rain_flag,
                avg(wWS) AS wind_speed_mean,
                avg(wWD) AS wind_dir_mean,
+               avg(sin(radians(wWD))) AS wind_dir_sin,
+               avg(cos(radians(wWD))) AS wind_dir_cos,
                count(*) AS weather_samples
         FROM read_parquet('{glob}', hive_partitioning=1)
         WHERE season IN ({yrs})
@@ -142,10 +144,22 @@ def add_degradation(lf: pl.LazyFrame) -> pl.LazyFrame:
     lf = lf.sort(["season", "gp", "session", "driver", "stint", "lap"])
     stint_keys = ["season", "gp", "session", "driver", "stint"]
     lf = lf.with_columns(
-        pl.col("laptime").first().over(stint_keys).alias("stint_first_laptime"))
+        pl.int_range(pl.len()).over(stint_keys).alias("_pos"))
+    flying_first = (
+        pl.when(pl.col("_pos") >= 1)
+        .then(pl.col("laptime"))
+        .drop_nulls()
+        .first()
+        .over(stint_keys)
+    )
+    lf = lf.with_columns(
+        pl.coalesce([flying_first, pl.col("laptime").first().over(stint_keys)])
+        .alias("stint_first_laptime"))
     lf = lf.with_columns([
-        (pl.col("laptime") - pl.col("stint_first_laptime"))
-            .alias("laptime_delta_stint_start"),
+        pl.when(pl.col("_pos") == 0)
+        .then(0.0)
+        .otherwise(pl.col("laptime") - pl.col("stint_first_laptime"))
+        .alias("laptime_delta_stint_start"),
         (pl.col("laptime")
             - pl.col("laptime").shift(1).over(stint_keys))
             .alias("laptime_delta_prev"),
@@ -153,8 +167,9 @@ def add_degradation(lf: pl.LazyFrame) -> pl.LazyFrame:
         (pl.col("s3") - pl.col("s2")).alias("sector_decay_32"),
     ])
     lf = lf.with_columns(
-        (pl.col("laptime_delta_stint_start") > 2.0).alias("cliff_flag"))
-    return lf
+        ((pl.col("laptime_delta_stint_start") > 2.0) & (pl.col("_pos") >= 1))
+        .alias("cliff_flag"))
+    return lf.drop(["_pos"])
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +196,12 @@ def build_lap_features(stats: pl.DataFrame, env: pl.DataFrame,
     keys = ["season", "gp", "session", "driver", "lap"]
     lap = lap.join(stats, on=keys, how="left")
     lap = lap.join(env, on=["season", "gp", "session"], how="left")
+    lap = lap.with_columns(
+        pl.when(pl.col("laptime") > 0)
+        .then(pl.col("n_samples") / pl.col("laptime"))
+        .otherwise(None)
+        .alias("telemetry_sample_rate_hz")
+    )
 
     out = GOLD / "lap_features.parquet"
     lap.write_parquet(out, compression="zstd")
