@@ -1,6 +1,7 @@
 """Unit tests for the optimizer's pure simulation helpers (no model artifacts)."""
 import numpy as np
 import polars as pl
+import pytest
 
 from src.models import optimizer as O
 
@@ -129,6 +130,67 @@ def test_simulate_discounts_pit_loss_inside_sc_window():
                            np.random.default_rng(1),
                            sc_windows=(np.full(4, 10.0), np.full(4, 1.0)))
     assert np.allclose(green, after_pit)
+
+
+def test_subsequent_stint_does_not_inherit_the_previous_tyres_degradation():
+    """A new stint must start from the car's FRESH pace.
+
+    The previous tyre's degradation must not be charged twice: once inside
+    the inherited base pace and again by the degradation term. Calibrating
+    the simulator against the realized lap times of the executed strategies
+    showed this error as a median per-stint over-prediction of ~40 s.
+    """
+    params = {
+        "beta": {"SOFT": 0.10, "MEDIUM": 0.10, "HARD": 0.10},
+        "sigma": {"SOFT": 0.0, "MEDIUM": 0.0, "HARD": 0.0},
+        "cluster_offset": {}, "temp_coef": 0.0, "temp_mean": 30.0,
+        "pace_offset": {"SOFT": 0.0, "MEDIUM": 0.0, "HARD": 0.5},
+        # censor_prob = 1.0 -> the cliff never fires, so the simulated time
+        # is deterministic
+        "cliff": {c: {"censor_prob": 1.0, "quantiles": [20.0]} for c in O.COMPOUNDS},
+    }
+    state = {"cur_lap": 5, "n_laps": 40, "compound": "MEDIUM",
+             "compounds_used": ["MEDIUM"], "stint": 1, "laps_into_stint": 11,
+             "cluster": -1, "temp": 30.0, "base_pace": 92.0, "in_cliff_now": False}
+    strategy = [("MEDIUM", 5, True), ("HARD", 40, False)]
+    total = float(O.simulate(strategy, state, params,
+                             O.SCENARIOS["clean_air"], 1,
+                             np.random.default_rng(0))[0])
+
+    k0 = state["laps_into_stint"] - 1          # laps already run on the old tyre
+    fresh = state["base_pace"] - params["beta"]["MEDIUM"] * k0
+    length = 40 - 5
+    expected = (length * (fresh + 0.5 - 0.0)
+                + params["beta"]["HARD"] * length * (length + 1) / 2.0
+                + O.PIT_LOSS + O.NEW_STINT_WARMUP)   # one stop
+    assert total == pytest.approx(expected, abs=1e-6)
+    # the naive (buggy) reference charges the old tyre's degradation again
+    naive = (length * (state["base_pace"] + 0.5)
+             + params["beta"]["HARD"] * length * (length + 1) / 2.0
+             + O.PIT_LOSS + O.NEW_STINT_WARMUP)
+    assert naive - total == pytest.approx(length * params["beta"]["MEDIUM"] * k0, abs=1e-6)
+
+
+def test_get_state_uses_a_flying_lap_not_the_pit_entry_lap():
+    """The decision lap is often the pit-ENTRY lap, which runs seconds slow.
+
+    Using it as the base pace inflates the whole evaluation by the in-lap
+    penalty times the number of remaining laps.
+    """
+    rows = []
+    for stint, laps in ((1, range(1, 11)), (2, range(11, 21))):
+        for lap in laps:
+            rows.append(dict(season="2025", gp="G", session="Race", driver="D",
+                              stint=stint, life=lap - 1, lap=lap,
+                              compound="SOFT", fuel_corr=90.0 if lap < 10 else 110.0,
+                              pace_above_best=0.0 if lap < 10 else 20.0,
+                              track_temp_mean=30.0, cluster=-1, rain_flag=0))
+    frame = pl.DataFrame(rows)
+    state = O.get_state(frame, "2025", "G", "Race", "D", 10)
+    # lap 10 is the pit-entry lap: its pace (110 s) and pace_above_best (20 s)
+    # must not be used as the base
+    assert state["base_pace"] == pytest.approx(90.0)
+    assert state["in_cliff_now"] is False
 
 
 def test_parse_strategy_resolves_end_and_marks_current():

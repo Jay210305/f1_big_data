@@ -293,48 +293,90 @@ def _elapsed_laps(state) -> int:
     return max(int(state.get("laps_into_stint", 0)) - 1, 0)
 
 
-def simulate(strategy, state, params, scen, n_sims, rng, sc_windows=None):
-    """Returns (n_sims,) total seconds for the remaining race."""
+def simulate(strategy, state, params, scen, n_sims, rng, sc_windows=None,
+             return_parts=False):
+    """Returns (n_sims,) total seconds for the remaining race.
+
+    The stint times are built from a FRESH-pace reference rather than from the
+    pace the car happens to be running now. Two structural errors were found
+    by calibrating the simulator against the realized lap times of the
+    strategies that were actually executed (see src/models/calibrate.py):
+
+    * the pace a stint inherited was the previous stint's TERMINAL pace, so
+      that stint's degradation was charged twice: once inside the inherited
+      base and again by the degradation term. The error grows with the number
+      of stints and with their length.
+    * the already-run degradation of the CURRENT tyre was not carried into
+      its remaining laps.
+
+    A third, empirical term -- `pace_drift` (s per lap) -- credits the pace
+    the car gains as the race progresses (the fuel burn-off that the fixed
+    0.03 s/lap fuel correction under-credits). It is fitted against the
+    realized lap times and defaults to zero.
+    """
     totals = np.zeros(n_sims)
     jump = params.get("cliff_jump", 1.5)
     slope = params.get("cliff_slope", 0.15)
     scen_pen = scen["pace_pen"]
+    pace_offset = params.get("pace_offset", {})
+    drift = float(params.get("pace_drift", 0.0))
+    parts = []
+    beta_tab = params.get("beta", {})
+    sigma_tab = params.get("sigma", {})
+    cliff_tab = params.get("cliff", {})
+    cluster_off = params.get("cluster_offset", {}).get(str(state["cluster"]), 0.0)
+    temp_term = params.get("temp_coef", 0.0) * (state["temp"] - params.get("temp_mean", 0.0))
+
+    beta_mu = (beta_tab.get(state["compound"], params.get("beta_global", 0.05))
+               + cluster_off + temp_term)
+    beta_cur = _sample_beta(rng, beta_mu, sigma_tab.get(state["compound"], 0.05), n_sims)
+    # The fresh pace of the compound the car is on now, i.e. the current pace
+    # minus the degradation the current tyre has already suffered.
+    k0 = _elapsed_laps(state)
+    fresh_pace = state["base_pace"] - beta_cur * k0
+    lap_ref = state["cur_lap"] - 1
+
     for i, (comp, end_lap, is_current) in enumerate(strategy):
-        L = end_lap - (state["cur_lap"] if is_current else
-                       strategy[i - 1][1])
+        start_lap = state["cur_lap"] if is_current else strategy[i - 1][1]
+        L = end_lap - start_lap
         L = max(int(L), 0)
         if L == 0:
+            # a stint with no remaining laps contributes nothing, but it must
+            # still occupy its slot so that `parts` stays aligned with the
+            # strategy positions
+            parts.append(np.zeros(n_sims))
             continue
         if is_current:
-            base = state["base_pace"]
-            beta_mu = (params.get("beta", {}).get(comp,
-                                                   params.get("beta_global", 0.05))
-                       + params["cluster_offset"].get(str(state["cluster"]), 0.0)
-                       + params["temp_coef"] * (state["temp"] - params["temp_mean"]))
-            sigma = params.get("sigma", {}).get(comp, 0.05)
-            cliff_cfg = params.get("cliff", {}).get(
-                comp, {"censor_prob": 1.0, "quantiles": [20.0]})
-            beta = _sample_beta(rng, beta_mu, sigma, n_sims)
-            cliff_rem = _sample_cliff(rng, cliff_cfg, n_sims) \
-                - _elapsed_laps(state)
+            base = fresh_pace
+            beta = beta_cur
+            cliff_rem = _sample_cliff(
+                rng, cliff_tab.get(comp, {"censor_prob": 1.0, "quantiles": [20.0]}),
+                n_sims) - k0
             if state["in_cliff_now"]:
                 cliff_rem = np.minimum(cliff_rem, -1.0)
         else:
-            pace_offset = params.get("pace_offset", {})
-            base = (state["base_pace"]
-                + pace_offset.get(comp, 0.0)
-                - pace_offset.get(state["compound"], 0.0))
-            beta_mu = (params.get("beta", {}).get(comp,
-                                                   params.get("beta_global", 0.05))
-                       + params["cluster_offset"].get(str(state["cluster"]), 0.0)
-                       + params["temp_coef"] * (state["temp"] - params["temp_mean"]))
-            sigma = params.get("sigma", {}).get(comp, 0.05)
-            cliff_cfg = params.get("cliff", {}).get(
-                comp, {"censor_prob": 1.0, "quantiles": [20.0]})
-            beta = _sample_beta(rng, beta_mu, sigma, n_sims)
-            cliff_rem = _sample_cliff(rng, cliff_cfg, n_sims)
+            # A fresh tyre on the new compound: the fresh pace of the car,
+            # shifted by the compound's own pace offset.
+            base = fresh_pace + pace_offset.get(comp, 0.0) \
+                - pace_offset.get(state["compound"], 0.0)
+            beta = _sample_beta(
+                rng,
+                beta_tab.get(comp, params.get("beta_global", 0.05)) + cluster_off + temp_term,
+                sigma_tab.get(comp, 0.05), n_sims)
+            cliff_rem = _sample_cliff(
+                rng, cliff_tab.get(comp, {"censor_prob": 1.0, "quantiles": [20.0]}),
+                n_sims)
         beta = beta * scen["beta_mult"]
-        totals += stint_time(base, scen_pen, beta, L, cliff_rem, jump, slope)
+        stint_total = stint_time(base, scen_pen, beta, L, cliff_rem, jump, slope)
+        if is_current:
+            # the current tyre's remaining laps also carry the degradation it
+            # has already suffered
+            stint_total = stint_total + beta * k0 * L
+        if drift:
+            mean_lap = 0.5 * (start_lap + 1 + end_lap)
+            stint_total = stint_total + drift * L * (mean_lap - lap_ref)
+        totals += stint_total
+        parts.append(stint_total)
     # The pit happens at the END of every stint that is followed by another
     # stint, so a strategy with k stints has exactly k-1 stops. The previous
     # implementation took the end lap of the *following* stint, which
@@ -351,6 +393,8 @@ def simulate(strategy, state, params, scen, n_sims, rng, sc_windows=None):
         totals += len(stop_laps) * NEW_STINT_WARMUP
     else:
         totals += len(stop_laps) * (PIT_LOSS + NEW_STINT_WARMUP)
+    if return_parts:
+        return totals, parts
     return totals
 
 
@@ -734,6 +778,21 @@ def get_state(df, season, gp, session, driver, lap, lapf=None, repo=None):
     # run, INCLUDING the lap the car is currently on. The zero-based index
     # of the current lap inside its stint is that count minus one.
     pos = int((sst["lap"] <= lap).sum())
+    # The base pace must be a FLYING lap. The lap the decision is taken on is
+    # often the pit-ENTRY lap, which runs 5-20 s slower than the flying pace
+    # and would otherwise be inherited by every subsequent stint, inflating
+    # the whole evaluation by ~(in-lap penalty) x (remaining laps). Use the
+    # last flying lap of the stint instead. (backtest.make_state applied
+    # this correction locally; here it is applied for every caller.)
+    base_pace = float(row["fuel_corr"])
+    pace_above_best = float(row["pace_above_best"] or 0.0)
+    is_last_lap_of_stint = int(sst["lap"].max() or 0) == int(lap)
+    pitted_after = bool((sub.filter(pl.col("stint") > stint).height > 0))
+    if is_last_lap_of_stint and pitted_after:
+        prev = sst.filter(pl.col("lap") < lap).sort("life")
+        if prev.height:
+            base_pace = float(prev["fuel_corr"][-1])
+            pace_above_best = float(prev["pace_above_best"][-1] or 0.0)
     # weather context: rain already observed in this session, or a wet tyre
     # currently in use. Used to restrict the candidate compound pool.
     so_far = sub.filter(pl.col("lap") <= lap)
@@ -744,8 +803,8 @@ def get_state(df, season, gp, session, driver, lap, lapf=None, repo=None):
         "season": season, "gp": gp, "session": session, "driver": driver,
         "cur_lap": int(lap), "n_laps": n_laps, "compound": row["compound"],
         "stint": stint, "laps_into_stint": max(pos, 0),
-        "base_pace": float(row["fuel_corr"]),
-        "in_cliff_now": bool((row["pace_above_best"] or 0) > 1.5),
+        "base_pace": base_pace,
+        "in_cliff_now": bool(pace_above_best > 1.5),
         "temp": float(row["track_temp_mean"] or 36.0),
         "cluster": int(row["cluster"]),
         "compounds_used": used,

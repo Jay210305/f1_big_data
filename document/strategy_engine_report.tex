@@ -30,7 +30,7 @@ unsupervised driving-style profiler (autoencoder + HDBSCAN), and a Monte Carlo
 strategy optimizer with scenario context and debounced cliff alerts. On an
 out-of-sample backtest over 313 real strategic decision points from the 2025
 season, the optimizer's recommendation improves on the actual executed
-strategy in 77.3\% of cases with a median paired gain of $+13.8$\,s.
+strategy in 77.6\% of cases with a median paired gain of $+18.0$\,s.
 A traceable MapReduce runtime and a MongoDB operational store independently
 verify batch transformations against Polars on shared data.
 \end{abstract}
@@ -266,8 +266,8 @@ same Monte Carlo with common random numbers (degradation parameters refit on
 \begin{tabular}{lr}
 \toprule
 Decisions evaluated & 313 \\
-Optimizer win rate & \textbf{77.3\%} \\
-$\Delta$ (actual $-$ recommended), median & $+13.8$\,s \\
+Optimizer win rate & \textbf{77.6\%} \\
+$\Delta$ (actual $-$ recommended), median & $+18.0$\,s \\
 $\Delta$ mean / p10 / p90 & $+2.3$ / $-75.2$ / $+36.8$\,s \\
 Avg.\ stops actual vs recommended & 1.66 vs 1.42 \\
 \bottomrule
@@ -287,6 +287,13 @@ degradation and pace parameters are priors rather than fitted values, so
 scoring them would measure the prior rather than the model. The
 \texttt{--include-wet} flag opts in.
 
+A realized-pace cross-check (\texttt{backtest\_realized.py}, 327 decisions)
+recommends the same compound as the executed strategy in 47.1\% of the
+decisions. Its delta is algebraically a restatement of the model's own
+compound pace offsets, so it is a consistency check rather than an
+independent validation; the independent check is the simulator calibration
+described below.
+
 \begin{figure}[h]\centering
 \phaseNineFigure{backtest_delta_histogram.png}{Run \texttt{python -m src.eval.plots} to generate this figure.}
 \caption{Distribution of the paired backtest $\Delta$. The median
@@ -304,10 +311,29 @@ estimates rather than extrapolations. (5) The wet compounds remain priors and
 the rain-affected races are excluded from the backtest by default.
 (6) Physical-target RUL is inherently noisy ($R^2\approx0.37$ ceiling after
 leakage removal) --- the earlier $0.61$ was strategy-confounded. (7) The
-realized-pace cross-check recommends the same compound as the real strategy
-in 45.3\% of decisions and is on average 8.1\,s slower on realized pace
-when it diverges, which points at an over-weighted compound-pace offset in
-the simulator.
+simulator has no race-position term: the calibration residual is $+0.6$\,s
+on average per stint but is larger for early stints and negative for late
+ones, because neither track temperature nor traffic is modelled.
+
+\section{Simulator calibration}
+Scoring the optimizer with the same simulator that recommends the strategy
+makes a systematic mis-calibration invisible to the backtest.
+\texttt{src/models/calibrate.py} closes that loop by scoring the production
+\texttt{optimizer.simulate()} against the strategies that were actually
+executed in 2025 (387 dry stints). It found two structural errors: the
+previous tyre's degradation was charged twice (once inside the inherited
+base pace and again by the degradation term), and the pit-ENTRY lap --- the
+lap the decision is normally taken on, 5--20\,s slower than the flying
+pace --- was used as the base pace outside the backtest. With a fresh-pace
+reference and a flying-lap base, the mean per-stint residual falls from
+$+38.4$\,s to $+0.6$\,s and the median from $+39.7$\,s to $-1.7$\,s.
+The backtest median paired gain rises from $+13.8$ to $+18.0$\,s and the
+systematic under-stopping (1.51 recommended stops against 1.66 actually
+run) disappears (1.73). The single underlying cause is the fixed
+0.03\,s/lap fuel correction, which under-credits the pace the car
+recovers as the fuel burns off; the residual coefficient that would absorb
+it was measured ($-0.04$\,s/lap) but not adopted, because it shifts every
+candidate equally and therefore cancels in the ranking.
 
 \section{Conclusion}
 A complete, reproducible, laptop-scale prescriptive strategy engine: from raw

@@ -11,7 +11,7 @@ with the artifacts they came from.
 saved artifacts in `data/` and from a live test/CLI run. Where an annotation disagrees with an
 artifact, the **artifact wins** and the discrepancy is called out explicitly.
 
-**Test suite:** **155 passed, 0 failed, 0 xfailed** — the 25 strict `xfail` markers that tracked
+**Test suite:** **157 passed, 0 failed, 0 xfailed** — the 25 strict `xfail` markers that tracked
 reproduced defects have all been removed because every one of those defects is now fixed and
 asserted by a passing test.
 
@@ -499,6 +499,12 @@ simulation with a discounted pit loss (default `pit_loss / 3`).
 (defect **M01** closed). The previous code charged the pit loss at the *following* stint's end lap,
 which both mis-priced the SC discount and counted the race-finish lap as a pit stop.
 
+**Every stint starts from the car's FRESH pace.** The pace a stint inherited was the previous stint's
+*terminal* pace, so that stint's degradation was charged twice — once inside the inherited base and
+again by the degradation term — and the error grew with the number of stops and with the stint
+length. The base is now `base_pace − β·k₀` (the current tyre's accumulated degradation removed), and
+the current tyre's already-run degradation is carried into its remaining laps. See §9.4.
+
 ### 8.3 Candidate generation
 
 Two physical rules constrain the candidate set (defect **M02** closed):
@@ -571,21 +577,21 @@ At each (2025 dry race, driver) decision point — the lap where stint 1 actuall
 |---|---|
 | Decisions evaluated | **313** (85 skipped: DNF / truncated) |
 | Races | **21** · simulations per decision: **250** · scenario: **`sc_hazard`** |
-| **Optimizer win rate** | **77.3%** |
-| Δ median (actual − recommended) | **+13.8 s** |
-| Δ mean / p10 / p90 | +1.1 / −72.6 / +37.0 s |
-| Avg stops: actual vs recommended | 1.66 vs 1.51 |
-| Stop-count match / divergent | 223 / 90 |
+| **Optimizer win rate** | **77.6%** |
+| Δ median (actual − recommended) | **+18.0 s** |
+| Δ mean / p10 / p90 | +7.6 / −63.7 / +44.8 s |
+| Avg stops: actual vs recommended | 1.66 vs 1.73 |
+| Stop-count match / divergent | 185 / 128 |
 
 **Selection-bias stratification (8.H.8.1) — implemented and reported:**
 
 | Stratum | n | Win rate | Δ median |
 |---|---|---|---|
-| Recommendation ≈ actual (matched stops) | 223 | **80.3%** | +11.8 s |
-| Recommendation diverges from actual | 90 | **70.0%** | +21.0 s |
+| Recommendation ≈ actual (matched stops) | 185 | **77.3%** | +14.4 s |
+| Recommendation diverges from actual | 128 | **78.1%** | +27.6 s |
 
-The win rate is *higher* where the recommendation agrees with reality, which is the honest way to
-read it: part of the 77.3% is "the model agrees with what the team did".
+After the calibration fix the two strata agree: the optimizer is no longer merely echoing the
+field, and where it *does* diverge it wins slightly more often and by more (+27.6 s vs +14.4 s).
 
 **Rain-affected races are excluded by default.** The Australian, Belgian and British Grands Prix
 use wet compounds, whose degradation and pace parameters are priors rather than fitted values;
@@ -606,7 +612,48 @@ is not yet trustworthy).
 5. **Cliff cost model too harsh** — 0.5 s/lap compounding forever. Fix: one-time +1.5 s jump then
    +0.15 s/lap (3× base rate).
 
-### 9.4 The realized-pace cross-check (partial bias mitigation)
+### 9.4 Simulator calibration against the realized lap times
+
+The backtest scores the recommender and the evaluator with the **same** simulator, so a systematic
+mis-calibration is invisible to it. `src/models/calibrate.py` closes that loop: it scores the
+**production** `optimizer.simulate()` against the strategies that were actually executed in the
+2025 dry races (387 dry stints over 293 driver-races).
+
+```
+residual = simulated − realized     (realized = the real fuel-corrected lap times)
+```
+
+**Before the fix:** mean **+38.4 s**, median **+39.7 s** per stint.
+**After the fix:** mean **+0.6 s**, median **−1.7 s** per stint — the simulator is now practically
+unbiased.
+
+Two structural errors were found:
+
+1. **The degradation was charged twice.** The base pace a stint inherited was the previous stint's
+   *terminal* pace, so that stint's degradation was charged once inside the inherited base and again
+   by the degradation term. The error grew with the number of stops and with the stint length. The
+   base is now the car's **fresh** pace (`base_pace − β·k₀`), and the current tyre's already-run
+   degradation is carried into its remaining laps.
+2. **The pit-entry lap was used as the base pace.** The decision is normally taken on the lap the
+   car enters the pits, which runs 5–20 s slower than the flying pace. The backtest corrected this
+   locally, but the **optimizer CLI did not** — every subsequent stint inherited the inflated pace.
+   `get_state` now always uses the last flying lap.
+
+**The single underlying cause** is the fixed **0.03 s/lap fuel correction** (`fuel_corr =
+laptime + 0.03·lap`), which under-credits the pace the car recovers as the fuel burns off. The
+residual coefficient that would absorb it was measured (−0.04 s/lap, i.e. an effective burn-off rate
+of ≈0.07 s/lap) but **not adopted**: it shifts every candidate by a similar amount and therefore
+cancels in the ranking that decides the recommendation.
+
+**Effect on the backtest:** the median paired gain rose from **+13.8 s to +18.0 s** (+31%), the
+mean from **+1.1 s to +7.6 s**, the negative tail shrank (−72.6 → −63.7 s), and the systematic
+**under-stopping disappeared**: the optimizer recommended 1.51 stops against the field's 1.66 before
+the fix and **1.73** after.
+
+**What remains:** the residual still depends on the race position — early stints are over-predicted
+and late ones under-predicted — because the simulator has no term for track temperature or traffic.
+
+### 9.5 The realized-pace cross-check (partial bias mitigation)
 
 `backtest_realized.py` scores the actual and the recommended strategy with the **real 2025 lap
 times** instead of the shared simulator:
@@ -614,21 +661,21 @@ times** instead of the shared simulator:
 | Metric | Value |
 |---|---|
 | Decisions | **327** (78 skipped) |
-| Win rate | **13.5%** · mean **−4.4 s** · median 0.0 · p10 −19.7 · p90 +4.3 |
-| Compound agreement | **148/327 = 45.3%** (Δ = 0 by construction) |
-| Where they differ (179) | mean **−8.1 s**, median −8.7 s, 44 wins |
-| Dominant divergences | SOFT→HARD (70), MEDIUM→HARD (65), MEDIUM→SOFT (32), HARD→SOFT (12) |
+| Win rate | **12.5%** · mean **−3.5 s** · median 0.0 · p10 −20.2 · p90 +8.0 |
+| Compound agreement | **154/327 = 47.1%** (Δ = 0 by construction) |
+
+**This metric is circular and is now labelled as such in the code and the report.** Its delta is
+algebraically `−(pace_offset[recommended] − pace_offset[actual]) × post-pit laps`, i.e. it
+*restates the model's own compound offsets* and can never falsify them. It is a consistency check,
+not an independent validation; the independent validation is §9.4.
 
 The previous 47.4% win rate was an **artefact of the M09 parsing bug** (the "final compound" was
-parsed as the race-end lap number, so the recommended compound always scored a zero pace offset
-and every non-MEDIUM actual looked like a win). With the parsing fixed the result is much soberer
-and much more informative: the optimizer usually picks the same compound as the team, and when it
-diverges it is systematically biased towards the harder tyre — the simulator over-values a long
-HARD stint because its β is smaller, under-weighting the compound pace offset.
+parsed as the race-end lap number, so the recommended compound always scored a zero pace offset and
+every non-MEDIUM actual looked like a win).
 
-### 9.5 Reports
+### 9.6 Reports
 
-- **`document/main.tex`** — Spanish, 10 sections, 10 pages, 5 figures. §5 is the
+- **`document/main.tex`** — Spanish, 11 sections, 11 pages, 5 figures. §5 is the
   *"Arquitecturas Big Data: MapReduce y MongoDB"*. Compiles natively with pdflatex, no unresolved
   references.
 - **`document/strategy_engine_report.tex`** — English, 10 sections, 9 pages, 5 figures.
@@ -930,9 +977,11 @@ asserted by ordinary passing tests; the suite is **155 passed, 0 failed, 0 xfail
 2. **The backtest's 77.3% is simulator-based.** Recommender and evaluator share the simulator.
    Mitigated, not eliminated, by the stratified breakdown (80.3% / 70.0%) and the realized-pace
    cross-check, which is much more sobering (13.5%).
-3. **The realized-pace check exposes a real calibration error.** When the optimizer diverges from
-   the executed compound it is biased towards the harder tyre (mean −8.1 s). The compound pace
-   offset is under-weighted relative to the cliff risk in the simulator.
+3. **The simulator has no race-position term.** After the calibration fix the per-stint residual
+   is +0.6 s on average, but it is positive for early stints and negative for late ones, because
+   neither track temperature nor traffic is modelled. The compound pace offset itself is now
+   unvalidated: the within-race evidence is far too noisy (±2.9 s per stint pair) to resolve a
+   0.1–0.3 s effect, and the "realized-pace cross-check" is circular.
 4. **The wet path is code without fitted parameters.** The backtest excludes the rain races for
    exactly that reason.
 5. **The live path now agrees with the batch path** on stint age and temperature, but it is still
@@ -945,15 +994,17 @@ asserted by ordinary passing tests; the suite is **155 passed, 0 failed, 0 xfail
 
 ### 13.3 Recommended next steps
 
-1. **Re-weight the compound pace offset in the simulator** so the optimizer stops over-picking
-   HARD for the final stint (the realized-pace check quantifies the gap: −8.1 s on 45% of the
-   decisions that diverge).
+1. **Validate the compound pace offset** against an independent signal: the within-race evidence is
+   far too noisy to resolve a 0.1–0.3 s compound effect, and the realized-pace cross-check is
+   circular by construction.
 2. **Fit the wet parameters** (pace offsets, degradation) instead of excluding the rain races.
 3. **Improve the cliff threshold**: the sensitivity sweep shows 2.0 s / 2 laps reaches AUC 0.905 and
    F1 0.732 versus the production 1.5 s / 3 laps at 0.896 / 0.674.
-4. **Dispatch the CI workflow** for the first time and record the result.
-5. **Commit Phase 9** so a fresh clone reproduces the whole project.
-6. **Replace the per-file MapReduce promotion** with a single atomic swap where the platform allows
+4. **Add a race-position term** to the simulator (track temperature, traffic), which is the
+   remaining structured part of the calibration residual.
+5. **Dispatch the CI workflow** for the first time and record the result.
+6. **Commit Phase 9** so a fresh clone reproduces the whole project.
+7. **Replace the per-file MapReduce promotion** with a single atomic swap where the platform allows
    it (POSIX), and document the Windows limitation where it does not.
 
 ---
@@ -1009,6 +1060,9 @@ asserted by ordinary passing tests; the suite is **155 passed, 0 failed, 0 xfail
 | P45 | The reports quote the current artifacts | Every number reconciled; both compile | ✅ |
 | P46 | The documented commands work | `backtest --source mongo` removed | ✅ |
 | P47 | CI passes | Local suite green; **hosted run never dispatched** | ⚠️ |
+| P48 | The simulator is unbiased against realized lap times | `src/models/calibrate.py`: per-stint residual mean **+0.6 s** / median **−1.7 s** over 387 dry stints | ✅ |
+| P49 | A stint starts from the car's fresh pace | `tests/test_optimizer.py::test_subsequent_stint_does_not_inherit_the_previous_tyres_degradation` | ✅ |
+| P50 | The base pace is a flying lap, never the pit-entry lap | `tests/test_optimizer.py::test_get_state_uses_a_flying_lap_not_the_pit_entry_lap` | ✅ |
 
 ---
 
@@ -1084,8 +1138,10 @@ key order so output bytes are stable across worker counts.
 
 ### 16.2 Additional limitations surfaced by this review
 
-5. **The compound choice is mis-calibrated** — the realized-pace check shows a −8.1 s mean bias
-   whenever the optimizer diverges from the executed compound.
+5. **The compound choice is not independently validated** — the within-race evidence is far too
+   noisy to resolve a 0.1–0.3 s compound effect, and the realized-pace cross-check is circular.
+   The simulator itself is now unbiased against the realized lap times, but it has no race-position
+   term (track temperature, traffic).
 6. **The wet compounds remain priors** and the rain races stay out of the backtest.
 7. **The live path depends on an external feed** that has not been validated against a real session.
 8. **CI has never been dispatched** — the green suite is local-only.
@@ -1094,8 +1150,9 @@ key order so output bytes are stable across worker counts.
 
 ### 16.3 Natural next steps
 
-- Re-weight the compound pace offset in the simulator (the −8.1 s bias is the clearest
-  improvement available).
+- Validate the compound pace offset against an independent signal (more races, or a
+  traffic-aware pace model); the within-race evidence is currently too noisy to resolve it,
+  and the realized-pace cross-check is circular by construction.
 - Fit the wet parameters and re-admit the rain races.
 - Adopt the better cliff threshold from the sensitivity sweep (2.0 s / 2 laps).
 - Dispatch the CI workflow for the first time.
@@ -1149,12 +1206,15 @@ Pit loss 21 s (7 s under SC).
 
 ### 17.4 Backtest
 
-313 decisions · 21 races · 250 sims · scenario `sc_hazard` · **win rate 77.3%** ·
-Δ median **+13.8 s** · mean +1.1 s · p10 −72.6 s · p90 +37.0 s · stops 1.51 vs 1.66 ·
-stratified 80.3% (matched, n=223) / 70.0% (divergent, n=90).
+313 decisions · 21 races · 250 sims · scenario `sc_hazard` · **win rate 77.6%** ·
+Δ median **+18.0 s** · mean +7.6 s · p10 −63.7 s · p90 +44.8 s · stops 1.73 vs 1.66 ·
+stratified 77.3% (matched, n=185) / 78.1% (divergent, n=128).
 
-Realized-pace cross-check: 327 decisions · win rate 13.5% · compound agreement 45.3% ·
-−8.1 s mean where they differ.
+Simulator calibration: per-stint residual mean **+0.6 s**, median **−1.7 s** over 387 dry stints
+(was +38.4 / +39.7 before the fresh-pace fix).
+
+Realized-pace cross-check: 327 decisions · win rate 12.5% · compound agreement 47.1% ·
+circular by construction (it restates the model's own offsets).
 
 ### 17.5 MapReduce
 

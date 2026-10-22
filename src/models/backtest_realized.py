@@ -175,6 +175,7 @@ def main() -> None:
 
     deltas = np.array([r["delta_realized"] for r in rows])
     wins = int((deltas > 0).sum())
+    same = [r for r in rows if r["rec_final_comp"] == r["actual_final_comp"]]
     summary = {
         "n_decisions": len(rows),
         "skipped": skipped,
@@ -183,19 +184,31 @@ def main() -> None:
         "delta_median": round(float(np.median(deltas)), 1),
         "delta_p10": round(float(np.quantile(deltas, 0.10)), 1),
         "delta_p90": round(float(np.quantile(deltas, 0.90)), 1),
+        "compound_agreement": round(len(same) / len(rows), 3),
         "note": ("Partial mitigation of backtest selection bias: compares "
                  "actual vs recommended strategy using REALIZED 2025 lap "
                  "times rather than the shared simulator. Compound-pace "
-                 "substitution is still a fitted proxy, not a counterfactual."),
+                 "substitution is still a fitted proxy, not a counterfactual. "
+                 "IMPORTANT: the delta is algebraically "
+                 "-(pace_offset[recommended] - pace_offset[actual]) x "
+                 "post-pit laps, so it RESTATES the model's own compound "
+                 "offsets and cannot falsify them; it is a consistency check, "
+                 "not an independent validation. The independent check is "
+                 "src/models/calibrate.py, which scores the simulator against "
+                 "the realized lap times of the executed strategies."),
     }
     print("\n" + "=" * 78)
     print("BACKTEST (REALIZED PACE) — 2025 races, decision at stint-1 end")
     print("=" * 78)
     print(f"  decisions      : {summary['n_decisions']}")
     print(f"  optimizer wins : {wins} ({summary['win_rate']:.1%})")
+    print(f"  same compound as the executed strategy: {summary['compound_agreement']:.1%}")
     print(f"  delta (actual realized - recommended realized, seconds):")
     print(f"    mean={summary['delta_mean']}  median={summary['delta_median']}  "
           f"p10={summary['delta_p10']}  p90={summary['delta_p90']}")
+    print("  NOTE: this delta restates the model's own compound pace offsets,")
+    print("        so it is a consistency check, not an independent")
+    print("        validation. See src/models/calibrate.py for that.")
 
     out = {"summary": summary, "decisions": rows}
     with open(MODELS_DIR / "phase7_backtest_realized.json", "w") as fh:

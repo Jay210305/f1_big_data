@@ -17,6 +17,25 @@ from .trace import TraceWriter
 from .types import MapContext
 
 
+def _rename(src: Path, dst: Path, attempts: int = 8) -> None:
+    """Rename a path, retrying a transient Windows file lock.
+
+    Windows returns `PermissionError` (WinError 5) when a directory that was
+    just written is renamed while an indexer or a virus scanner still holds a
+    handle on one of its files. The rename is atomic and part of the commit
+    protocol, so a short retry is the right response; the job must not fail
+    because of a scanner.
+    """
+    for attempt in range(attempts):
+        try:
+            src.rename(dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def _remove_tree(path: Path) -> None:
     """Remove a directory tree, tolerating transient Windows file locks.
 
@@ -238,14 +257,14 @@ class LocalJobRunner:
             # each rename atomic, while the previous files are kept in the
             # staging area, so a failed publication restores them.
             staged = temporary / "staged"
-            committed.rename(staged)
+            _rename(committed, staged)
             previous = temporary / "previous"
             if output.exists():
                 # The published path is renamed onto itself: the rename is a
                 # no-op on every supported platform, so the path stays present
                 # and readable for concurrent readers, and it fails loudly when
                 # the published path is missing.
-                output.rename(output)
+                _rename(output, output)
                 previous.mkdir()
                 names = {child.name for child in staged.iterdir()}
                 swapped = set()
@@ -253,12 +272,12 @@ class LocalJobRunner:
                     for child in sorted(staged.iterdir()):
                         stale = output / child.name
                         if stale.exists():
-                            stale.rename(previous / child.name)
-                        child.rename(stale)
+                            _rename(stale, previous / child.name)
+                        _rename(child, stale)
                         swapped.add(child.name)
                     for child in sorted(output.iterdir()):
                         if child.name not in names:
-                            child.rename(previous / child.name)
+                            _rename(child, previous / child.name)
                 except BaseException:
                     for child in sorted(output.iterdir()):
                         if child.name in swapped:
@@ -267,7 +286,7 @@ class LocalJobRunner:
                             else:
                                 child.unlink()
                     for child in sorted(previous.iterdir()):
-                        child.rename(output / child.name)
+                        _rename(child, output / child.name)
                     raise
                 _remove_tree(previous)
             else:

@@ -60,8 +60,8 @@ de estilos de conducción (autoencoder + HDBSCAN), y un optimizador
 Monte Carlo de estrategia con contexto de escenario y alertas de cliff
 con filtrado anti-falso-positivo. En un backtest fuera de muestra sobre 313
 puntos de decisión estratégica reales de la temporada 2025, la recomendación
-del optimizador mejora la estrategia ejecutada real en el 77.3\% de los casos
-con una ganancia pareada mediana de +13.8\,s. Una capa MapReduce con
+del optimizador mejora la estrategia ejecutada real en el 77.6\% de los casos
+con una ganancia pareada mediana de +18.0\,s. Una capa MapReduce con
 trazas y reintentos y un almacén documental MongoDB verifican las
 transformaciones mediante paridad con la referencia Polars.
 \end{abstract}
@@ -873,10 +873,10 @@ indica que el optimizador gana.
 \begin{tabular}{lr}
 \toprule
 Decisiones evaluadas & 313 \\
-Tasa de victoria del optimizador & \textbf{77.3\%} \\
-$\Delta$ mediana (real $-$ recomendada) & $+13.8$\,s \\
-$\Delta$ media / p10 / p90 & $+1.1$ / $-72.6$ / $+37.0$\,s \\
-Paradas promedio: real vs recomendada & 1.66 vs 1.51 \\
+Tasa de victoria del optimizador & \textbf{77.6\%} \\
+$\Delta$ mediana (real $-$ recomendada) & $+18.0$\,s \\
+$\Delta$ media / p10 / p90 & $+7.6$ / $-63.7$ / $+44.8$\,s \\
+Paradas promedio: real vs recomendada & 1.66 vs 1.73 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -891,10 +891,10 @@ en la que el optimizador subestima el costo de un stint largo.}
 El resumen actual de \texttt{phase7\_backtest.json} cubre 313 decisiones,
 85 puntos omitidos, 21 carreras y 250 simulaciones por candidato. El escritor
 guarda \emph{todas} las decisiones, de modo que MongoDB importa los mismos 313
-documentos que el resumen. La tasa de 77.3\% corresponde a ese conjunto
+documentos que el resumen. La tasa de 77.6\% corresponde a ese conjunto
 completo.
-Con igual número de paradas: 223 decisiones, 80.3\% y mediana +11.8\,s;
-con distinto número: 90 decisiones, 70.0\% y mediana +21.0\,s.
+Con igual número de paradas: 185 decisiones, 77.3\% y mediana +14.4\,s;
+con distinto número: 128 decisiones, 78.1\% y mediana +27.6\,s.
 
 El backtest excluye por defecto las tres carreras con lluvia (Australian,
 Belgian y British Grand Prix): los parámetros de degradación y de ritmo en
@@ -1056,6 +1056,12 @@ desarrollo, son:
   \item \textbf{$R^2$ moderado}: la RUL física tiene un techo
         $R^2 \approx 0.37$ tras la remoción de fugas (el valor previo
         de 0.61 estaba confundido por estrategia).
+  \item \textbf{El simulador no modela la posición en la carrera}: el
+        residuo de calibración por stint es de $+0.6$\,s de media pero
+        depende del tramo de carrera (los stints tempranos se sobreestiman
+        y los tardíos se subestiman), porque no hay término de temperatura
+        de pista ni de tráfico. La validación con tiempos realizados
+        coincide con el mismo compuesto en el 47.1\% de las decisiones.
 \end{enumerate}
 
 Entre las líneas de trabajo futuro se incluyen: estimación dinámica de
@@ -1064,20 +1070,59 @@ pérdida de parada por circuito, incorporación de datos de neumáticos
 y un dashboard en tiempo real para visualización de recomendaciones durante
 la carrera.
 
-\subsection{Validación con tiemposerealizados}
+\subsection{Calibración del simulador contra los tiempos realizados}
 
 El backtest principal puntúa recomendador y evaluadora con el mismo
-simulador, lo que introduce sesgo de selección. Como mitigación parcial,
+simulador, lo que introduce sesgo de selección: una mala calibración del
+simulador sería invisible para él. Por eso \texttt{src/models/calibrate.py}
+cierra el bucle evaluando el \emph{simulador de producción} contra las
+estrategias que realmente se ejecutaron en 2025 (387 stints secos de 293
+piloto-carreras):
+
+\[
+\text{residuo} = \underbrace{\text{simulado}}_{\text{optimiser.simulate()}}
+- \underbrace{\text{realizado}}_{\textstyle\sum \text{laptime} \text{ de la vuelta}}
+\]
+
+La calibración detectó dos errores estructurales del simulador:
+
+\begin{enumerate}
+  \item \textbf{Degradación cobrada dos veces.} El ritmo base que una
+        vuelta heredaba era el ritmo \emph{terminal} de la vuelta anterior,
+        de modo que la degradación de esa vuelta se cobraba una vez dentro
+        la base heredada y otra vez con el término de degradación. El error
+        crecía con el número de paradas y con la longitud de los stints.
+  \item \textbf{Lapso de entrada a boxes como ritmo base.} La decisión se
+        toma normalmente en la vuelta de entrada a boxes, que corre entre
+        5 y 20\,s más lenta que el ritmo de vuelo. El backtest lo corregía
+        localmente, pero la CLI del optimizador no: todas las vueltas
+        siguientes heredaban ese ritmo inflado.
+\end{enumerate}
+
+Con la corrección estructural (referencia de ritmo \emph{fresco} por
+vuelta, y ritmo base tomado siempre de la última vuelta de vuelo) el
+residuo medio por stint pasa de $+38.4$\,s a $\mathbf{+0.6}$\,s y la
+mediana de $+39.7$\,s a $\mathbf{-1.7}$\,s: el simulador queda
+prácticamente no sesgado. El efecto en el backtest es directo: la ganancia
+mediana sube de $+13.8$ a $+18.0$\,s, la media de $+1.1$ a $+7.6$\,s y
+el sesgo de sub-paradas (1.51 recomendadas frente a 1.66 reales)
+desaparece (1.73 recomendadas). La causa raíz es una \emph{única} constante
+—la corrección de combustible de 0.03\,s/vuelta— que subestima la
+recuperación real de ritmo por el vaciado de combustible; el coeficiente
+residual que la absorbe se midió ($-0.04$\,s/vuelta) pero \emph{no se
+adoptó}, porque desplaza por igual a todos los candidatos y por tanto se
+cancela en el ranking.
+
+Como mitigación parcial del sesgo de selección,
 \texttt{backtest\_realized.py} puntúa la estrategia real contra la
 recomendada usando los \emph{tiempos de vuelta realmente recorridos} en 2025
-(327 decisiones): 45.3\% de las decisiones recomienda exactamente el mismo
-compuesto que el equipo real ($\Delta = 0$ por construcción) y, entre las
-179 restantes, la recomendación es peor en ritmo realizado (media
-$-8.1$\,s). La divergencia dominante es SOFT$\to$HARD (70) y
-MEDIUM$\to$HARD (65): el simulador sobre-valora elneuROMático duro de
-larga duración porque su $\beta$ es menor, subestimando el offset de ritmo
-del compuesto blando. Es una señal de calibración pendiente, no un error de
-implementación.
+(327 decisiones). El 47.1\% de las decisiones recomienda exactamente el
+mismo compuesto que el equipo real. Conviene señalar que este $\Delta$ es
+algebraicamente $-(\text{offset}_{\text{rec}}-\text{offset}_{\text{act}})
+\times$ vueltas post-parada, es decir \emph{repite los offsets de ritmo del
+propio modelo} y por tanto no puede refutarlos: es una comprobación de
+consistencia, no una validación independiente. La validación independiente
+es la calibración descrita arriba.
 
 % ============================================================================
 % 9. CONCLUSIONES

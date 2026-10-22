@@ -115,6 +115,7 @@ See `document/phase9_defense_notes.md` and `document/phase9_traceability.md`.
 | Feature importance + SHAP | `python -m src.models.feature_importance` | `data/models/feature_importance/*` |
 | Hyperparameter sanity/study | `python -m src.models.tune_rul [--study N]` | `data/models/tune_*.json` |
 | Cliff-threshold sensitivity | `python -m src.models.sensitivity_cliff` | `data/models/cliff_sensitivity.{json,md}` |
+| Simulator calibration vs realized lap times | `python -m src.models.calibrate [--apply]` | `data/models/calibration.json` |
 | Realized-pace backtest | `python -m src.models.backtest_realized` | `data/models/phase7_backtest_realized.json` |
 | Dependency benchmark | `python -m src.verify_deps` | console report |
 | Tests + CI | `python -m pytest tests/` | `.github/workflows/ci.yml` |
@@ -212,8 +213,16 @@ See `annotations/phase_8_4_1_wet_weather.md` and
 - Wet compounds use first-order rain and track-drying proxies; the backtest
   excludes the three rain-affected races by default because those parameters
   are priors rather than fitted values. Use `--include-wet` to score them.
-- The realized-pace cross-check shows the recommended compound is slower than
-  the executed one by ~8 s on the 45% of decisions where they differ, i.e. the
-  simulator under-weights the compound pace offset relative to cliff risk.
+- The realized-pace cross-check (`backtest_realized.py`) recommends the same
+  compound as the executed strategy in 47.1% of decisions. Its delta restates
+  the model's own compound pace offsets, so it is a consistency check, not
+  an independent validation; the independent check is
+  `python -m src.models.calibrate`, which scores the production simulator
+  against the realized lap times of the executed strategies.
+- The simulator is calibrated against those realized lap times: the mean
+  per-stint residual is +0.6 s (median -1.7 s) over 387 dry stints. The
+  residual still depends on the race position (early stints are
+  over-predicted, late ones under-predicted) because neither track
+  temperature nor traffic is modelled.
 - Backtest comparison shares the simulator between recommender and evaluator
   (selection bias documented in `annotations/phase_7_report.md`).
