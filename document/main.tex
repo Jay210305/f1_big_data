@@ -487,8 +487,10 @@ grupos con error máximo $5.69\times10^{-14}$.
 En Silver 2025 coinciden 69\,459 filas a tolerancia, con error numérico
 máximo $2.71\times10^{-13}$. El combiner reduce 103\,244 pares a
 69\,459 y 96\,823\,560 bytes a 65\,750\,633 bytes (32.09\%).
-La ejecución con traza tarda 89.70\,s y sin combiner ni traza 48.38\,s:
-esta comparación no aísla el efecto temporal del combiner.
+La ejecución sin traza tarda 48.38\,s (sin combiner) y 56.02\,s (con
+combiner); con traza completa el tiempo sube a 89.7--118.8\,s según la
+carga del disco. Esta comparación no aísla el efecto temporal del combiner:
+la traza escribe decenas de megabytes por etapa.
 \begin{figure}[!htbp]\centering
 \phaseNineFigure{mapreduce_shuffle.png}{Ejecutar el generador de figuras de Phase 9.}
 \caption{Distribución por partición y reducción medida de bytes de shuffle.}

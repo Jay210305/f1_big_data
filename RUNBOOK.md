@@ -74,7 +74,8 @@ python -m src.nosql.cli health
 | Focused tests | `python -m pytest tests/test_mapreduce.py tests/test_nosql.py tests/test_phase9_parity.py tests/test_phase9_integration.py -q` | pure tests always run; live Mongo tests require a reachable server |
 
 These are measured local workloads, not timing guarantees. Stint MR took
-12.37 s and the 2025 Silver job with tracing took 89.70 s. The Silver run
+8.53 s and the 2025 Silver job took 56.02 s without tracing (118.81 s with
+the full trace; the first measurement, on a loaded disk, was 89.70 s). The Silver run
 covered one season; it does not claim a five-season MR replay. The complete
 stint trace verifies 107,606 inputs, 106,735 emitted pairs and 4,981 keys.
 Filtered inputs may emit zero pairs; key count is independent of reducer count.
