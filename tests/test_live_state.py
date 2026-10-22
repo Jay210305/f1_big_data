@@ -8,7 +8,10 @@ def test_incremental_state_tracks_pace_temperature_and_slope():
     snapshot = state.update_lap({"lap": 2, "laptime": 90.2, "compound": "MEDIUM",
                                  "track_temp": 32.0})
     assert snapshot["fuel_corr"] == 90.26
-    assert snapshot["track_temp_mean"] == 31.0
+    # track_temp_mean mirrors the batch optimizer: the CURRENT lap's track
+    # temperature, not a session running average.
+    assert snapshot["track_temp_mean"] == 32.0
+    assert snapshot["track_temp_session_mean"] == 31.0
     assert snapshot["pace_above_best"] > 0
     assert snapshot["degradation_slope"] > 0
     assert snapshot["cur_lap"] == 2

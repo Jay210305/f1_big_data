@@ -10,6 +10,7 @@ executor. Each stage checks for its artifacts; use --force to rerun a stage.
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 import time
@@ -22,13 +23,26 @@ BRONZE = DATA / "bronze" / "telemetry"
 GOLD = DATA / "gold"
 MODELS = DATA / "models"
 
-STAGES = ["etl", "verify_schema", "gold", "rul", "style", "degradation",
-          "optimizer"]
+STAGES = ["etl", "verify_schema", "gold", "rul", "style", "labeled", "degradation",
+          "optimizer", "mapreduce", "mongo"]
 
 
 def _done(path: Path, min_size: int = 1000) -> bool:
     return path.exists() and (path.is_dir() and any(path.iterdir())
                               or path.is_file() and path.stat().st_size > min_size)
+
+
+def _invalidate(paths) -> list[Path]:
+    """Drop cached artifacts so the stages that depend on them re-run."""
+    removed = []
+    for path in paths:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(path)
+        elif path.exists():
+            path.unlink()
+            removed.append(path)
+    return removed
 
 
 def _run(cmd: list[str]):
@@ -61,17 +75,36 @@ def main():
                 [py, "-m", "src.models.train_rul", "--epochs", "40"]),
         "style": (lambda: _done(MODELS / "phase5_metrics.json"),
                   [py, "-m", "src.models.train_style"]),
+        "labeled": (lambda: _done(GOLD / "labeled_frame.parquet"),
+                    [py, "-m", "src.models.export_labeled"]),
         "degradation": (lambda: _done(MODELS / "degradation_model.json"),
                         [py, "-m", "src.models.fit_degradation"]),
         "optimizer": (lambda: _done(MODELS / "phase6_demo.json"),
                       [py, "-m", "src.models.optimizer"]),
+        "mapreduce": (lambda: _done(DATA / "mapreduce/parity.json"),
+                      [py, "-m", "src.mapreduce.cli", "all"]),
+        "mongo": (lambda: False,
+                  [py, "-m", "src.nosql.cli", "ingest", "--skip-if-unavailable"]),
     }
+    style_ran = False
     for s in stages:
         is_done, cmd = plan[s]
         if is_done() and not args.force:
             print(f"[skip] {s} (artifacts present)")
             continue
+        if args.force and s in {"labeled", "mapreduce"}:
+            cmd = cmd + ["--force"]
+        if s == "mongo" and style_ran:
+            # The cluster labels were re-fitted: the stored ones are stale.
+            cmd = cmd + ["--refresh-clusters"]
         _run(cmd)
+        if s == "style":
+            # A new style fit rewrites the driver clusters, so every artifact
+            # derived from them is dropped and rebuilt by the later stages.
+            style_ran = True
+            removed = _invalidate([GOLD / "labeled_frame.parquet", DATA / "mapreduce"])
+            print(f"[invalidate] style re-fit: dropped {len(removed)} stale "
+                  "artifact(s) (labeled frame, mapreduce outputs/parity)")
     print(f"\nPipeline complete in {time.time()-t0:.0f}s. "
           f"Run the backtest: python -m src.models.backtest")
 

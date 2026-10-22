@@ -81,6 +81,9 @@ def main():
                     help="evaluate the empirical SC/VSC hazard scenario")
     ap.add_argument("--pit-loss-sc", type=float, default=None,
                     help="pit loss under SC/VSC (default: pit-loss / 3)")
+    ap.add_argument("--include-wet", action="store_true",
+                    help="also score rain-affected races (the wet "
+                         "degradation/pace parameters are priors, not fitted)")
     args = ap.parse_args()
     t0 = time.time()
     ns = args.n_sims
@@ -104,9 +107,17 @@ def main():
 
     wet_races = sorted({k[1] for k, stints in actual.items()
                          if any(c in WET_COMPOUNDS for c, _, _ in stints)})
-    print(f"[bt] including {len(wet_races)} rain-affected races: {wet_races}")
+    if args.include_wet:
+        print(f"[bt] INCLUDING {len(wet_races)} rain-affected races "
+              f"(wet model is prior-based, not fitted): {wet_races}")
+    else:
+        print(f"[bt] excluding {len(wet_races)} rain-affected races "
+              f"(the wet degradation/pace parameters are priors, not fitted; "
+              f"use --include-wet to score them anyway): {wet_races}")
 
     races = sorted({k[1] for k in actual})
+    if not args.include_wet:
+        races = [r for r in races if r not in set(wet_races)]
     if args.races:
         races = races[:args.races]
 
@@ -256,7 +267,7 @@ def main():
               f"{len(sub_rows)} decisions; delta={abl[vname]['delta_mean_vs_actual']}s")
 
     out = {"summary": summary, "ablations": abl,
-           "decisions": rows[:200],
+           "decisions": rows,
            "notes": ("Degradation params refit on 2021-2024 only; paired MC "
                      "with common random numbers; recommended strategy chosen "
                      "by the same simulator (selection bias documented). "

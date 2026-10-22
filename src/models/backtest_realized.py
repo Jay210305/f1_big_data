@@ -114,12 +114,19 @@ def main() -> None:
         # per lap that cancels in the delta, so raw laptime sum suffices for
         # a like-for-like comparison)
         actual_realized = float(sub["laptime"].sum())
+        # The strategy string looks like "HARD->34 | INTERMEDIATE->57", so
+        # splitting it on "->" leaves the RACE-END LAP NUMBER as the last
+        # element, not a compound. Prefer the structured strategy the
+        # optimizer returns and fall back to a careful string parse.
+        structured = best.get("_strat") or []
         try:
-            first_pit = int(best["strategy"].split("->")[1].split(" ")[0])
+            if structured:
+                first_pit = int(structured[0][1])
+            else:
+                first_pit = int(best["strategy"].split("->")[1].split(" ")[0])
         except (IndexError, ValueError):
             skipped += 1
             continue
-        # recommended compound on the final stint (parsed from the strategy)
         # recommended realized estimate: realized laps until recommended pit,
         # then the realized pace penalized by substituting to the recommended
         # compound (HARD is slower on pace; SOFT faster). Pit loss is NOT
@@ -132,7 +139,17 @@ def main() -> None:
             skipped += 1
             continue
         actual_final_comp = post_pit["compound"][-1]
-        rec_final_comp = best["strategy"].split("->")[-1].split(" ")[0]
+        if structured:
+            rec_final_comp = str(structured[-1][0])
+        else:
+            parts = best["strategy"].split("->")
+            rec_final_comp = (parts[-2].split("|")[-1].strip()
+                              if len(parts) >= 2 else parts[-1].strip())
+        if rec_final_comp not in OPT.COMPOUNDS:
+            skipped += 1
+            continue
+        if actual_final_comp not in OPT.COMPOUNDS:
+            actual_final_comp = rec_final_comp
         po = params.get("pace_offset", {})
         pace_delta = po.get(rec_final_comp, 0.0) - po.get(actual_final_comp, 0.0)
         rec_realized = float(pre_pit["laptime"].sum()) \

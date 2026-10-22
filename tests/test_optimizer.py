@@ -32,15 +32,38 @@ def test_sample_cliff_shape_and_censor():
     assert (out[~np.isinf(out)].min()) >= 0.0
 
 
-def test_enumerate_strategies_includes_zero_stop():
+def test_enumerate_strategies_respects_two_compound_rule():
+    """A dry race must be run on at least two compounds (F1 rule).
+
+    The zero-stop candidate is therefore only legal when the compounds used
+    so far already satisfy the rule; otherwise the candidate set contains a
+    two-compound plan only.
+    """
     state = {"cur_lap": 10, "n_laps": 57, "compound": "MEDIUM",
              "compounds_used": {"MEDIUM"}}
     strats = O.enumerate_strategies(state)
-    assert any(len(s) == 1 and s[0][2] is True for s in strats)
-    # every non-current segment ends before or at race end
+    assert not any(len(s) == 1 and s[0][2] is True for s in strats)
     for s in strats:
+        # every candidate ends up on at least two compounds in total
+        assert len(state["compounds_used"] | {c for c, _, _ in s}) >= 2
+        # every non-current segment ends before or at race end
         for comp, end_lap, cur in s:
             assert 0 < end_lap <= state["n_laps"]
+
+    # with two compounds already used, staying on the current one is legal
+    state2 = dict(state, compounds_used={"MEDIUM", "SOFT"})
+    strats2 = O.enumerate_strategies(state2)
+    assert any(len(s) == 1 and s[0][2] is True for s in strats2)
+
+
+def test_enumerate_strategies_excludes_wet_tyres_in_dry_context():
+    state = {"cur_lap": 10, "n_laps": 57, "compound": "MEDIUM",
+             "compounds_used": {"MEDIUM"}}
+    assert all(c in O.DRY for s in O.enumerate_strategies(state)
+               for c, _, _ in s)
+    wet_state = dict(state, wet=True)
+    assert any(c in ("INTERMEDIATE", "WET") for s in O.enumerate_strategies(wet_state)
+               for c, _, _ in s)
 
 
 def test_sample_sc_windows_uses_conditional_hazard_and_seed():
@@ -75,6 +98,12 @@ def test_branch_point_summary_selects_green_and_sc_plans():
 
 
 def test_simulate_discounts_pit_loss_inside_sc_window():
+    """The discounted pit loss applies to a stop that falls INSIDE the SC window.
+
+    The pit happens at the END of the stint that precedes it, so for the
+    strategy [(MEDIUM, 5, True), (SOFT, 10, False)] the stop is at lap 5 —
+    an SC at lap 10 happens after the pit and must NOT discount it.
+    """
     state = {"cur_lap": 5, "n_laps": 15, "compound": "MEDIUM",
              "cluster": -1, "temp": 30.0, "laps_into_stint": 1,
              "base_pace": 90.0, "in_cliff_now": False}
@@ -88,12 +117,18 @@ def test_simulate_discounts_pit_loss_inside_sc_window():
     }
     strategy = [("MEDIUM", 5, True), ("SOFT", 10, False)]
     scen = {"beta_mult": 1.0, "pace_pen": 0.0, "pit_loss_sc": 7.0}
-    windows = (np.full(4, 10.0), np.full(4, 1.0))
     green = O.simulate(strategy, state, params, scen, 4,
                        np.random.default_rng(1))
-    under_sc = O.simulate(strategy, state, params, scen, 4,
-                          np.random.default_rng(1), sc_windows=windows)
-    assert np.allclose(green - under_sc, O.PIT_LOSS - 7.0)
+    # SC covering the pit lap (5) -> discounted pit loss
+    on_pit = O.simulate(strategy, state, params, scen, 4,
+                        np.random.default_rng(1),
+                        sc_windows=(np.full(4, 5.0), np.full(4, 1.0)))
+    assert np.allclose(green - on_pit, O.PIT_LOSS - 7.0)
+    # SC after the pit (lap 10) -> the stop already happened, no discount
+    after_pit = O.simulate(strategy, state, params, scen, 4,
+                           np.random.default_rng(1),
+                           sc_windows=(np.full(4, 10.0), np.full(4, 1.0)))
+    assert np.allclose(green, after_pit)
 
 
 def test_parse_strategy_resolves_end_and_marks_current():

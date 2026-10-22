@@ -1,6 +1,7 @@
 # Plan: Phase 8 — Rigor, Robustness & Capability Hardening
 
-**Status: NOT STARTED**
+**Status: IMPLEMENTED — Phase 8 tiers and engineering hygiene shipped.**
+**Phase 9:** COMPLETE — MapReduce, MongoDB and integration are tracked in `PLAN3.md`.
 **Predecessor:** All of Phases 0–7 are complete (`PLAN.md`, status "ALL PHASES COMPLETE").
 **Purpose of this file:** A checkpointed follow-on roadmap that closes the methodological,
 engineering, and capability gaps identified in the post-mortem review of the F1 Prescriptive

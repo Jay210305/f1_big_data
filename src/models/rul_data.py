@@ -320,10 +320,15 @@ def compute_rolling_features(df: pl.DataFrame) -> pl.DataFrame:
         roll_cols = [c for c in green.columns if c not in orig_cols]
         df = df.join(green.select(STINT_KEYS + ["life"] + roll_cols),
                      on=STINT_KEYS + ["life"], how="left")
-        # Forward-fill (and backward-fill if stint starts under SC) per stint
+        # Forward-fill across SC laps only. A backward fill would copy the
+        # FIRST GREEN LAP's rolling value into the SC laps that precede it,
+        # i.e. it would import future information into the opening laps of a
+        # stint that started under a Safety Car. Forward fill is strictly
+        # causal: an SC lap inherits the last pace actually observed. Laps
+        # before the first green lap of the stint have no observed pace and
+        # stay null (undefined), which is the honest representation.
         for c in roll_cols:
-            df = df.with_columns(
-                pl.col(c).forward_fill().backward_fill().over(STINT_KEYS))
+            df = df.with_columns(pl.col(c).forward_fill().over(STINT_KEYS))
         return df
     return _compute_rolling_features_raw(df)
 

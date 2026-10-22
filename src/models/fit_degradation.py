@@ -194,9 +194,11 @@ def _fit_sc_hazard() -> dict:
     """Fit empirical SC/VSC onset hazards and affected-window durations.
 
     The hazard is conditional on the race still being green at the start of a
-    lap. Each race contributes one exposure at every lap before its first
-    neutralisation and one onset event at the first affected lap. This keeps
-    the table suitable for sequential Monte Carlo sampling.
+    lap. Each race contributes one exposure at every lap up to and including
+    its first neutralisation lap, and one onset event at that lap. The onset
+    lap itself belongs to the risk set: the race was still green when the lap
+    started, so excluding it would drop every event at that lap from the
+    denominator and make the fitted hazard exceed 1.
     """
     from src.models.rul_data import load_sc_laps
 
@@ -230,7 +232,11 @@ def _fit_sc_hazard() -> dict:
         first_onset = runs[0][0] if runs else None
         circuit_races[circuit] = circuit_races.get(circuit, 0) + 1
         for lap in range(SC_HAZARD_MIN_LAP, n_laps + 1):
-            if first_onset is not None and lap >= first_onset:
+            # The onset lap stays in the risk set: the race was still green
+            # when that lap started, so it contributes one exposure AND the
+            # event. Excluding it removed every event at that lap and made
+            # the fitted hazard exceed 1.
+            if first_onset is not None and lap > first_onset:
                 break
             exposure[(circuit, lap)] = exposure.get((circuit, lap), 0) + 1
         if first_onset is not None:
@@ -239,8 +245,14 @@ def _fit_sc_hazard() -> dict:
 
     hazard = {}
     for (circuit, lap), n_exposed in exposure.items():
+        if n_exposed <= 0:
+            continue
+        # onset[(circuit, lap)] counts races whose FIRST onset was this lap;
+        # exposure counts the races still green when the lap started. The two
+        # sets are disjoint, so the ratio is a probability in [0, 1].
+        value = onset.get((circuit, lap), 0) / n_exposed
         hazard.setdefault(circuit, {})[str(lap)] = round(
-            onset.get((circuit, lap), 0) / n_exposed, 6)
+            min(max(value, 0.0), 1.0), 6)
     circuit_prior = {}
     for circuit, n_races in circuit_races.items():
         events = sum(1 for (name, _), count in onset.items()
@@ -255,7 +267,10 @@ def _fit_sc_hazard() -> dict:
         "circuit_prior": circuit_prior,
         "duration_laps": sorted(set(durations)) or [1],
         "duration_mean": round(float(np.mean(durations)), 3) if durations else 1.0,
-        "notes": "First SC/VSC onset per race; hazard is conditional on prior green laps.",
+        "notes": ("First SC/VSC onset per race; the hazard is conditional on "
+                  "the race still being green at the start of the lap. The "
+                  "onset lap belongs to the risk set, so every cell is a "
+                  "probability in [0, 1]."),
     }
     return result
 
@@ -320,7 +335,11 @@ def fit_degradation(df=None, save=True):
                   "(race-start traffic artifacts, counted as censored); "
                   "cluster offsets only for clusters with >=30 race stints; "
                   "sigma is IQR-robust (raw std destroyed by traffic outliers); "
-                  "cliff cost = one-time jump + 0.15 s/lap beyond the cliff"),
+                  "cliff cost = one-time jump + 0.15 s/lap beyond the cliff; "
+                  "wet-compound slopes can come out negative because the "
+                  "track-drying trend dominates the tyre's own wear, so the "
+                  "Monte-Carlo sampler floors every rate at 0.005 s/lap and "
+                  "never applies a negative degradation"),
     }
     for c in COMPOUNDS:
         sub = st.filter(pl.col("comp") == c)

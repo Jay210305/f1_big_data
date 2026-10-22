@@ -23,6 +23,7 @@ dependencies = [
     "shap>=0.46",
     "optuna>=3.6",
     "streamlit>=1.40",
+    "pymongo>=4.8",
 ]
 
 [dependency-groups]
@@ -32,6 +33,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["mongo: requires a live MongoDB server (skipped when unavailable)"]
 
 [tool.uv]
 # torch is deliberately excluded: it must be installed separately with CUDA

@@ -34,6 +34,79 @@ python -m src.run_all --force      # full rebuild from scratch
 | 7 | Backtest | `python -m src.models.backtest` | `data/models/phase7_backtest.json` | ~40 s |
 | 8.2.1 | SC/VSC hazard fit + optimizer | `python -m src.models.fit_degradation` then `python -m src.models.optimizer --sc-hazard` | `data/models/degradation_model.json` (`sc_hazard`) + `phase6_demo.json` | ~30 s + demo |
 
+## Phase 9 — MapReduce and optional MongoDB
+
+MapReduce uses local worker processes and does not require MongoDB. MongoDB
+needs a running `mongod` server. Compass is an optional GUI, `mongosh` an
+optional shell, and PyMongo is the Python driver; Compass alone is not a server.
+The default URI is `mongodb://localhost:27017` (override `MONGO_URI`), and
+the default database is `f1_tyre` (override `MONGO_DB`). The measured setup
+is one local node; no replica set or sharded deployment is claimed.
+Install the repository dependencies (`python -m pip install -r requirements.txt`)
+to provide PyMongo in the active environment.
+
+For a native Windows installation, start the installed MongoDB service
+(`Start-Service MongoDB`, administrator shell if required). For an existing
+Docker installation, start Docker Desktop and use a named persistent volume:
+
+```powershell
+docker run -d --name f1-mongo -p 27017:27017 -v f1mongo:/data/db mongo:7
+# On later runs, use: docker start f1-mongo
+python -m src.nosql.cli health
+```
+
+| Stage | Command | Evidence |
+|---|---|---|
+| Shared input | `python -m src.models.export_labeled` | `data/gold/labeled_frame.parquet`, 107,606 × 85 |
+| MR jobs + cached evidence | `python -m src.mapreduce.cli all` | `data/mapreduce/output/`, `data/mapreduce/parity.json` |
+| Full stint trace | `python -m src.mapreduce.cli run --job stint_stats --trace --force` | complete JSONL trace, metrics and four partitions |
+| Fault replay | `python -m src.mapreduce.cli run --job stint_stats --trace --inject-fault map 3 1 --output data/mapreduce/output/stint_stats_retry --force` | retry event; compare final `part-*.jsonl` hashes |
+| Independent equivalence | `python -m src.mapreduce.evidence --silver` | MR/Polars/saved-model parity and Silver comparison |
+| Ingest once | `python -m src.nosql.cli ingest --scope all --output data/mongo/ingest_first.json` | per-collection upsert counters |
+| Idempotency | `python -m src.nosql.cli ingest --scope all --output data/mongo/ingest_second.json` | same counts, zero modified/upserted on second pass |
+| Schema quality | `python -m src.nosql.cli quality` | `data/mongo/quality_report.json` |
+| CRUD + query examples | `python -m src.nosql.cli crud` then `python -m src.nosql.cli queries` | operation results and projections |
+| Indexes + explain | `python -m src.nosql.cli index --explain` | `data/mongo/index.json` (use `explain` for `explain.json`) |
+| Query plans | `python -m src.nosql.cli explain` | `data/mongo/explain.json` |
+| Synthetic benchmark | `python -m src.nosql.cli benchmark --n 100000` | `data/mongo/benchmark.json`, deterministic synthetic collection |
+| Three-way parity | `python -m src.mapreduce.evidence --mongo --silver` | Mongo/MR/Polars per-stint comparison |
+| Evidence figures | `python -m src.eval.plots` (all) or `--only <name>` | nine PNGs in `eval_plots/`: `rul_predicted_vs_actual`, `degradation_curves`, `cluster_embeddings`, `backtest_delta_histogram`, `scenario_multiplier_regression`, `critical_zone_r2`, `mapreduce_shuffle`, `mongo_indexes`, `three_way_parity` |
+| Focused tests | `python -m pytest tests/test_mapreduce.py tests/test_nosql.py tests/test_phase9_parity.py tests/test_phase9_integration.py -q` | pure tests always run; live Mongo tests require a reachable server |
+
+These are measured local workloads, not timing guarantees. Stint MR took
+12.37 s and the 2025 Silver job with tracing took 89.70 s. The Silver run
+covered one season; it does not claim a five-season MR replay. The complete
+stint trace verifies 107,606 inputs, 106,735 emitted pairs and 4,981 keys.
+Filtered inputs may emit zero pairs; key count is independent of reducer count.
+
+```powershell
+python -m src.models.optimizer --source mongo --season 2025 `
+  --gp "Bahrain Grand Prix" --driver VER --lap 12 --n-sims 500
+python -m src.models.backtest --sc-hazard
+streamlit run app/streamlit_app.py
+```
+
+The optimizer logs its selected source and any Parquet fallback. The dashboard's
+**Historial MongoDB** tab remains available without uploading a replay; an
+unavailable server shows an operational message. `run_all` includes `labeled`
+before Phase 9, supports cached MapReduce output and skips MongoDB when the
+server is unavailable. Backtesting remains a manual operation.
+
+The `phase7_backtest.json` summary evaluates **313** decisions and the writer
+now retains the full history, so MongoDB imports the same **313** documents as
+the summary. A full ingest also prunes documents the source no longer
+produces, so a re-ingest after a backtest change cannot leave stale rows
+behind. The summary's current scenario is `sc_hazard`: **77.3%** wins,
+median **+13.8 s**, 1.51 recommended stops against 1.66 actually run.
+
+`backtest.py` has no `--source` flag: the backtest always reads the lakehouse.
+Only `optimizer.py` can be pointed at MongoDB (`--source mongo`). The
+rain-affected races (Australian, Belgian, British) are excluded from the
+backtest by default because the wet degradation/pace parameters are priors
+rather than fitted values; `--include-wet` opts in.
+
+See `document/phase9_defense_notes.md` and `document/phase9_traceability.md`.
+
 ## Engineering-hygiene tools (cross-cutting)
 
 | Task | Command | Artifacts |
@@ -130,10 +203,17 @@ See `annotations/phase_8_4_1_wet_weather.md` and
 
 ## Known limitations (see annotations for details)
 
-- Optimizer leans 1-stop vs actual field behaviour (1.33 vs 1.66 avg stops).
+- Optimizer leans 1-stop vs actual field behaviour (1.51 vs 1.66 avg stops).
 - Pit loss is circuit-constant (default 21 s).
-- Scenario multipliers (clean air / DRS / backmarker) are priors, not fitted.
-- Wet compounds use first-order rain and track-drying proxies; detailed
-  rainfall intensity remains a future data-source improvement.
+- Scenario multipliers (clean air / DRS / backmarker) are fitted from the
+  observed `dirty_air_frac` distribution (1.000 / 1.323 / 1.891), but that
+  distribution is sparse, so they are floor-capped estimates rather than
+  extrapolations.
+- Wet compounds use first-order rain and track-drying proxies; the backtest
+  excludes the three rain-affected races by default because those parameters
+  are priors rather than fitted values. Use `--include-wet` to score them.
+- The realized-pace cross-check shows the recommended compound is slower than
+  the executed one by ~8 s on the 45% of decisions where they differ, i.e. the
+  simulator under-weights the compound pace offset relative to cliff risk.
 - Backtest comparison shares the simulator between recommender and evaluator
   (selection bias documented in `annotations/phase_7_report.md`).

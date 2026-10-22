@@ -2,6 +2,36 @@
 
 This document describes the type, structure, and size of the Formula 1 data stored in this project.
 
+## Phase 9 derived artifacts and document collections
+
+The canonical Phase 9 input is `data/gold/labeled_frame.parquet`:
+**107,606 rows × 85 columns**, including `fuel_corr`, SC labels and driver
+cluster. Raw `lap_features.parquet` (317,264 × 61) lacks these derived fields
+and is not interchangeable with this input.
+
+| Artifact / collection | Source and population | Verified size / role |
+|---|---|---|
+| `data/mapreduce/output/stint_stats/` | labeled laps, warm-up/SC exclusions and minimum four laps | 4,628 eligible stints: 4,274 dry, 354 wet |
+| `data/mapreduce/output/lap_aggregate/` | 2025 Bronze/Silver telemetry | 69,459 output laps; one-season replay |
+| `data/mapreduce/output/driver_profile/` | labeled driver/session-type groups | 70 groups |
+| Mongo `race_sessions` | Silver weather/corners/RCM + Gold environmental metadata | one embedded document per available session; measured ingest manifest is authoritative |
+| Mongo `laps` | materialized labeled input | 107,606 documents after full ingest |
+| Mongo `stints` | `data/gold/stint_degradation.parquet` | 44,298 documents; raw Gold slope differs from MR's filtered fuel-corrected slope |
+| Mongo `strategy_decisions` | `phase7_backtest.json::decisions` | 313 stored historical documents; full summary evaluated 313 |
+| Mongo `bench_laps` | deterministic synthetic generator | 100,000 benchmark documents retained in the synthetic benchmark collection |
+
+The current Gold driver-style table has **178 rows**, with season/driver groups
+and another lap population; it is not a 70-row driver/session parity target.
+The saved degradation model includes three dry compounds only. Wet MR/Polars
+statistics are measured on 354 stints but have no saved-model equality target.
+
+Runtime traces, retry evidence, JSONL outputs and parity tables live under
+`data/mapreduce/`; Mongo ingest, schema-quality, explain and benchmark evidence
+live under `data/mongo/`. These are derived, regenerable, ignored data artifacts.
+Figures live in `eval_plots/{mapreduce_shuffle,mongo_indexes,three_way_parity}.png`.
+The server is local and single-node; document/index bytes and `collStats` in the
+benchmark represent that deployment, not measured replication or sharding.
+
 ## Project Overview
 
 This repository is a local collection of the **TracingInsights public F1 telemetry datasets** for the 2021–2025 Formula 1 seasons. Each season is organized as a self-contained folder that mirrors the upstream TracingInsights GitHub repository for that year.

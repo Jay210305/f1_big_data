@@ -3,12 +3,17 @@
 \usepackage{booktabs}
 \usepackage{amsmath}
 \usepackage{graphicx}
+\graphicspath{{../eval_plots/}{eval_plots/}}
+\newcommand{\phaseNineFigure}[2]{%
+  \IfFileExists{../eval_plots/#1}{\includegraphics[width=\linewidth]{../eval_plots/#1}}{%
+    \IfFileExists{eval_plots/#1}{\includegraphics[width=\linewidth]{eval_plots/#1}}{\fbox{\parbox{0.9\linewidth}{#2}}}}%
+}
 \usepackage{hyperref}
 \usepackage{caption}
 \title{Prescriptive Tyre Compound Management and In-Race Stint Strategy Engine\\
 \large An End-to-End Big Data \& Machine Learning Pipeline over Formula 1 Telemetry (2021--2025)}
 \author{Big Data Project}
-\date{August 2026}
+\date{October 2026}
 
 \begin{document}
 \maketitle
@@ -25,7 +30,9 @@ unsupervised driving-style profiler (autoencoder + HDBSCAN), and a Monte Carlo
 strategy optimizer with scenario context and debounced cliff alerts. On an
 out-of-sample backtest over 313 real strategic decision points from the 2025
 season, the optimizer's recommendation improves on the actual executed
-strategy in 78.6\% of cases with a median paired gain of $+15$\,s.
+strategy in 77.3\% of cases with a median paired gain of $+13.8$\,s.
+A traceable MapReduce runtime and a MongoDB operational store independently
+verify batch transformations against Polars on shared data.
 \end{abstract}
 
 \section{System Architecture}
@@ -66,6 +73,111 @@ causal running-best gap (\texttt{pace\_above\_best}). Environmental context
 index (chronological weekend rubber accumulation with $\gamma_{\text{wash}}=0.3$
 wet-session resets) complete the store.
 
+\section{Big Data Architectures: MapReduce and MongoDB}
+The local multi-process runtime makes split, map, optional combine,
+shuffle/sort, reduce and atomic commit explicit. Three real jobs aggregate
+telemetry, fit stint slopes and describe driver/session profiles. Stable
+CRC32 partitioning co-locates keys. An injected failure in map 3 produces
+one retry and byte-identical output in all four final partitions.
+This is a single-host prototype; multi-node scaling is not measured.
+
+The shared labeled artifact has 107,606 rows and 85 columns. The full
+stint trace verifies 106,735 emissions across 4,981 keys and four nonempty
+partitions, preserving key/value multisets and independently reducing them.
+Filtering explains the difference between map inputs and emissions.
+MR and Polars agree within $3.56\times10^{-15}$ over 4,628 eligible stints
+(4,274 dry, 354 wet). The saved model agrees for dry compounds only;
+it has no wet entries, so its global match flag is false.
+\begin{table}[!htbp]\centering\scriptsize
+\caption{Slope medians and robust spread (s/lap).}
+\label{tab:phase9-parity}
+\begin{tabular}{lrrrr}\toprule
+Compound & MR $\beta$ & Polars $\beta$ & Model $\beta$ & $\sigma$ \\
+\midrule
+SOFT & 0.124613 & 0.124613 & 0.124613 & 0.161852 \\
+MEDIUM & 0.091976 & 0.091976 & 0.091976 & 0.132238 \\
+HARD & 0.051580 & 0.051580 & 0.051580 & 0.080191 \\
+INTERMEDIATE & -0.053286 & -0.053286 & --- & 0.429045 \\
+WET & -0.226707 & -0.226707 & --- & 0.196299 \\
+\bottomrule\end{tabular}\end{table}
+
+Raw Gold uses another target/filter (mean absolute slope difference 3.7098,
+maximum 363.0841); its 44,298 stints are not an equality target.
+The driver/session reference agrees over 70 groups within
+$5.69\times10^{-14}$; the 178-row driver-style artifact uses other groups.
+Silver 2025 agrees over 69,459 rows within $2.71\times10^{-13}$.
+The combiner reduces shuffled pairs from 103,244 to 69,459 and bytes from
+96,823,560 to 65,750,633 (32.09\%). Trace-enabled versus trace-disabled
+runtimes do not isolate combiner speedup.
+
+MongoDB stores embedded race sessions, labeled laps, Gold stints and
+available strategy history. Strict JSON-Schema validators reuse ingest
+coercions; deterministic identifiers make batch upserts idempotent.
+The server is \texttt{mongod}; Compass is an optional GUI,
+\texttt{mongosh} an optional shell and PyMongo the Python client.
+The measured ingest has 576 sessions, 44,298 stints, 107,606 laps and
+200 decisions. A second ingest keeps these counts with zero modifications
+or upserts in all four collections. The quality sweep reports zero schema
+violations and zero nonnumeric lap times in \texttt{laps}. Missing optional
+fields in other collections are reported separately. BSON supports IEEE-754
+NaN/infinity; coercion to null is an analytical-quality policy. All six
+measured plans change COLLSCAN to FETCH/IXSCAN. Fewer examined documents
+need not improve latency: the HARD query measured 51 versus 52\,ms.
+
+\begin{table}[!htbp]\centering\scriptsize
+\caption{Real explain: examined documents before/after and index keys.}
+\label{tab:phase9-explain}
+\begin{tabular}{lrrrr}\toprule
+Query & Returned & Docs pre & Docs post & Keys post \\
+\midrule
+driver history & 30 & 107606 & 30 & 30 \\
+season & 21179 & 107606 & 21179 & 21179 \\
+tyre age & 5016 & 107606 & 5016 & 5016 \\
+hard tyre & 42763 & 107606 & 42763 & 42763 \\
+slow laps & 4601 & 107606 & 4601 & 4601 \\
+fast laps & 26659 & 107606 & 26659 & 26659 \\
+\bottomrule\end{tabular}\end{table}
+
+Server-side window/group pipelines reproduce the stint estimator with the
+same exclusions. Explain compares returned rows, documents and keys examined,
+with measured collection/index space and synthetic write overhead.
+The live MongoDB/MR/Polars proof covers the same 4,628 stints and five
+compounds; maximum MongoDB/Polars difference is $1.78\times10^{-15}$.
+The warm-up position is materialized before the SC filter. This three-way
+proof does not invent missing wet entries in the saved dry model.
+The reproducible table snapshot is \texttt{data/models/phase9\_tables.json}.
+\begin{table}[!htbp]\centering\scriptsize
+\caption{Measured index cost: 100,000 synthetic documents.}
+\label{tab:phase9-storage}
+\begin{tabular}{lrr}\toprule
+Metric & Only \texttt{\_id} & Four indexes \\
+\midrule
+Insert (s) & 1.507 & 2.323 \\
+Docs/s & 66,366 & 43,053 \\
+Logical bytes & 21111910 & 21111910 \\
+Index bytes & 610304 & 2301952 \\
+\bottomrule\end{tabular}\end{table}
+Indexed insertion costs 1.541 times the \texttt{\_id}-only load.
+Immediate WiredTiger physical allocation depends on checkpoints; logical
+and index bytes are the comparable capacity measures. At batch size 1,000,
+streaming peaks at 1,649,106 Python-allocation bytes versus 141,560,662 for
+a materialized list (85.84 times). These are \texttt{tracemalloc} allocations,
+not process RSS or server memory. Streaming meets the 16\,MiB budget; the
+list exceeds it. From 1,000 to 100,000 documents, cursor peak grows only
+from 1,632,402 to 1,650,682 bytes. Batch sizes 1/100/1,000/10,000 take
+97.51/3.26/2.28/2.43\,s in the measured sweep.
+
+\begin{figure}[!htbp]\centering
+\phaseNineFigure{mongo_indexes.png}{Run MongoDB explain and benchmark to generate this evidence.}
+\caption{Measured local index impact and storage cost.}\end{figure}
+\begin{figure}[!htbp]\centering
+\phaseNineFigure{three_way_parity.png}{Run the three-way parity proof with MongoDB.}
+\caption{Independent implementations of the shared stint estimator.}\end{figure}
+The optimizer repository and Spanish Streamlit history tab consume the
+document store; unavailable MongoDB is handled explicitly. Only one local
+server is measured: replication and sharding remain architecture discussion.
+Parity proves computational equivalence, not causal strategy validity.
+
 \section{Model 1: RUL \& Cliff Prediction}
 \textbf{Labels.} Stints truncated by Safety Cars, DNFs, or short experimental
 runs are filtered. The physical cliff $T_{\text{end}}$ is the first sustained
@@ -80,21 +192,30 @@ excluded from the input matrix (leakage audit: none present).
 \toprule
 Model & MAE & RMSE & $R^2$ & MAE$_{\text{RUL}\le10}$ & NASA-PHM \\
 \midrule
-Naive (compound mean) & 6.77 & 8.31 & 0.10 & 4.79 & 47896 \\
-XGBoost (asymmetric) & 4.80 & 7.06 & 0.35 & 2.51 & 28103 \\
-XGBoost (symmetric ref.) & 4.70 & 6.85 & 0.39 & 2.70 & 29576 \\
-LSTM (asymmetric) & 5.85 & 8.99 & $-0.06$ & \textbf{2.08} & 35221 \\
-\textbf{Piecewise Blend (Prod.)} & 4.95 & 7.73 & 0.22 & \textbf{2.20} & 29343 \\
+Naive (compound mean) & 6.81 & 8.30 & 0.09 & 5.15 & 50496 \\
+XGBoost (asymmetric) & 5.31 & 7.37 & 0.29 & 3.08 & 34052 \\
+XGBoost (symmetric ref.) & 5.07 & 6.94 & 0.37 & 3.28 & 34881 \\
+LightGBM (asymmetric) & 5.29 & 7.55 & 0.25 & 2.67 & 31372 \\
+LSTM (asymmetric) & 6.43 & 9.10 & -0.09 & 2.74 & 36266 \\
+Piecewise Blend (Prod.) & 5.80 & 8.22 & 0.11 & 3.08 & 36080 \\
 \bottomrule
 \end{tabular}
-\caption{RUL regression (laps). The LSTM provides end-of-life sensitivity; XGBoost provides macro stability; a continuous piecewise blend $w(\text{RUL}_{\text{xgb}})$ is executed in production (\texttt{optimizer.py}).}
+\caption{RUL regression (laps). Current test has 22,675 laps; LightGBM has the best critical-zone MAE (2.67); a continuous piecewise blend $w(\text{RUL}_{\text{xgb}})$ is executed in production (\texttt{optimizer.py}).}
 \end{table}
 
 The cliff classifier (XGB+LightGBM probability ensemble, threshold tuned on
 validation with recall-biased robust selection) predicts the onset of the
 performance cliff within 3 laps from pure telemetry:
-$F_1=0.747$, AUC$=0.889$. After removing all target leakage, the earlier
+$F_1=0.674$, AUC$=0.896$. After removing all target leakage, the earlier
 $F_1=0.997$ (v1) is correctly exposed as flag memorisation.
+
+\begin{figure}[h]\centering
+\phaseNineFigure{rul_predicted_vs_actual.png}{Run \texttt{python -m src.eval.plots} to generate this figure.}
+\caption{Predicted versus actual remaining useful life on the held-out 2025
+split, per engine and coloured by compound. The shaded band is the critical
+zone ($RUL\le10$ laps); the vertical spread there shows the engine resolves
+absolute error but not the ranking of laps near the cliff.}
+\end{figure}
 
 \section{Model 2: Driving-Style Profiler}
 In/out-laps, non-hot laps ($>107\%$ of session best) and SC/VSC laps are
@@ -102,28 +223,42 @@ excluded (44\% of laps removed). Each remaining lap is encoded as a
 micro-sector vector (10 standardised distance bins $\times$
 \{max lateral G, throttle, braking, speed\}) plus track-evolution and
 environmental covariates. A GPU autoencoder (55$\to$16 latent) yields
-driver-season signatures; HDBSCAN finds two archetypes (silhouette 0.69):
+driver-season signatures; HDBSCAN finds two archetypes among 172
+driver-seasons (silhouette 0.76):
 \begin{itemize}
-\item \textbf{Cluster 0} (112 driver-seasons; the established front-runners):
+\item \textbf{Cluster 1} (115 driver-seasons; the established front-runners):
 highest cornering load (lat-G 36.8) yet the gentlest fuel-corrected
-degradation ($-0.05$\,s/lap) --- elite cornering efficiency.
-\item \textbf{Cluster 1} (28; mostly rookies/test drivers): smoothest inputs
-but steepest degradation ($-0.18$\,s/lap).
+degradation ($-0.040$\,s/lap) --- elite cornering efficiency.
+\item \textbf{Cluster 0} (23; mostly rookies/test drivers): smoothest inputs
+but steepest degradation ($-0.195$\,s/lap).
+\item \textbf{Noise} (34): part-time and test drivers, no consistent archetype.
 \end{itemize}
+
+\begin{figure}[h]\centering
+\phaseNineFigure{cluster_embeddings.png}{Run \texttt{python -m src.eval.plots} to generate this figure.}
+\caption{2-D t-SNE projection of the 16-D style latent space, coloured by
+HDBSCAN cluster; the legend carries each cluster's mean degradation slope.}
+\end{figure}
 
 \section{Model 3: Pit-Window Optimizer}
 A degradation model fitted on 2021--24 races (warm-up-excluded stint slopes:
-$\beta_{\text{S}}=0.107 > \beta_{\text{M}}=0.076 > \beta_{\text{H}}=0.045$\,s/lap;
+$\beta_{\text{S}}=0.125 > \beta_{\text{M}}=0.092 > \beta_{\text{H}}=0.052$\,s/lap;
 robust IQR $\sigma$; empirical cliff-lap distributions; pairwise within-driver
 compound pace offsets) drives a Monte Carlo evaluator with analytic stint
 times. Candidate 0/1/2-stop strategies are ranked per scenario (clean air /
-DRS train $\beta\times1.15$ / backmarker $\beta\times1.25$) with p5--p95
+DRS train $\beta\times1.323$ / backmarker $\beta\times1.891$) with p5--p95
 confidence bands. An in-race monitor applies debounced cliff alerts
 ($\ge$2 consecutive laps above threshold) and a joint rule: a cliff alert with
 RUL $>15$ laps is classified as transient thermal degradation, not wear.
 
+\begin{figure}[h]\centering
+\phaseNineFigure{degradation_curves.png}{Run \texttt{python -m src.eval.plots} to generate this figure.}
+\caption{Measured per-compound degradation curves against the fitted
+$\beta$ line (fuel-corrected, SC laps and the out-lap excluded).}
+\end{figure}
+
 \section{Backtest (2025, out-of-sample)}
-At each driver's first real pit window (stint-1 end) in 19 dry races, the
+At each driver's first real pit window (stint-1 end) in 21 races, the
 actual remaining strategy and the optimizer's recommendation are scored by the
 same Monte Carlo with common random numbers (degradation parameters refit on
 2021--24 only):
@@ -131,28 +266,53 @@ same Monte Carlo with common random numbers (degradation parameters refit on
 \begin{tabular}{lr}
 \toprule
 Decisions evaluated & 313 \\
-Optimizer win rate & \textbf{78.6\%} \\
-$\Delta$ (actual $-$ recommended), median & $+15.0$\,s \\
-$\Delta$ mean / p10 / p90 & $+2.1$ / $-76.2$ / $+37.9$\,s \\
-Avg.\ stops actual vs recommended & 1.66 vs 1.33 \\
+Optimizer win rate & \textbf{77.3\%} \\
+$\Delta$ (actual $-$ recommended), median & $+13.8$\,s \\
+$\Delta$ mean / p10 / p90 & $+2.3$ / $-75.2$ / $+36.8$\,s \\
+Avg.\ stops actual vs recommended & 1.66 vs 1.42 \\
 \bottomrule
 \end{tabular}
-\caption{Paired Monte Carlo backtest. Ablations: removing the cliff model
+\caption{Paired Monte Carlo backtest (sc\_hazard, 250 simulations). Ablations: removing the cliff model
 changes 99/120 recommendations; pace offsets 17/120; style clusters 0/120.}
 \end{table}
+
+The saved summary covers all 313 evaluated decisions across 21 races
+(85 skipped), and the writer now retains the full history, so MongoDB imports
+the same 313 documents as the summary. Matched stop counts: 223 decisions,
+80.3\% wins, median +11.8\,s; divergent counts: 90 decisions, 70.0\%
+wins, median +21.0\,s.
+
+The backtest excludes the three rain-affected races by default: the wet
+degradation and pace parameters are priors rather than fitted values, so
+scoring them would measure the prior rather than the model. The
+\texttt{--include-wet} flag opts in.
+
+\begin{figure}[h]\centering
+\phaseNineFigure{backtest_delta_histogram.png}{Run \texttt{python -m src.eval.plots} to generate this figure.}
+\caption{Distribution of the paired backtest $\Delta$. The median
+($+13.8$\,s) describes the typical case; the mean ($+1.1$\,s) reflects the
+negative tail where the optimizer under-costs a long stint.}
+\end{figure}
 
 \section{Limitations}
 (1) The recommender and evaluator share the simulator (selection bias); true
 counterfactual race outcomes are unknowable. (2) The optimizer leans one-stop
 relative to actual field behaviour. (3) Pit loss is circuit-constant (21\,s).
-(4) Scenario multipliers are priors, not fitted. (5) Wet races are excluded.
-(6) Physical-target RUL is inherently noisy ($R^2\approx0.39$ ceiling after
-leakage removal) --- the earlier $0.61$ was strategy-confounded.
+(4) The scenario multipliers are fitted from the observed dirty-air
+distribution, but that distribution is sparse, so they are floor-capped
+estimates rather than extrapolations. (5) The wet compounds remain priors and
+the rain-affected races are excluded from the backtest by default.
+(6) Physical-target RUL is inherently noisy ($R^2\approx0.37$ ceiling after
+leakage removal) --- the earlier $0.61$ was strategy-confounded. (7) The
+realized-pace cross-check recommends the same compound as the real strategy
+in 45.3\% of decisions and is on average 8.1\,s slower on realized pace
+when it diverges, which points at an over-weighted compound-pace offset in
+the simulator.
 
 \section{Conclusion}
 A complete, reproducible, laptop-scale prescriptive strategy engine: from raw
 JSON to ranked, uncertainty-quantified pit recommendations that beat real
-2025 strategies in $\sim$79\% of decision points under the fitted
+2025 strategies in $\sim$77\% of decision points under the fitted
 degradation physics. All code, metrics, and phase annotations are versioned;
 the runbook (\texttt{RUNBOOK.md}) executes the full pipeline end-to-end.
 

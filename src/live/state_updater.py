@@ -54,6 +54,9 @@ class IncrementalState:
         result.update({"fuel_corr": self.fuel_corr,
                        "pace_above_best": self.pace_above_best,
                        "track_temp_mean": self.track_temp_mean,
+                       "track_temp_session_mean": (
+                           self._temp_sum / self._temp_count
+                           if self._temp_count else None),
                        "degradation_slope": self.degradation_slope})
         return result
 
@@ -70,11 +73,20 @@ class IncrementalState:
 
         Required keys are ``lap``, ``laptime`` and ``compound``. Weather and
         cluster values are optional, which matches the OpenF1 adapter payload.
+
+        A new stint resets the stint-local aggregates. The stint number from
+        the feed is authoritative when present, so a pit onto the SAME
+        compound still starts a new stint (a compound change alone would
+        miss it).
         """
         lap_number = int(lap["lap"])
         compound = str(lap.get("compound") or self.compound).upper()
-        if compound != self.compound:
-            self.stint += 1
+        explicit_stint = lap.get("stint")
+        stint_changed = (explicit_stint is not None
+                         and int(explicit_stint) != self.stint)
+        if compound != self.compound or stint_changed:
+            self.stint = (int(explicit_stint) if explicit_stint is not None
+                          else self.stint + 1)
             self.laps_into_stint = 0
             self.best_pace = None
             self._x_sum = self._y_sum = self._xx_sum = self._xy_sum = 0.0
@@ -100,9 +112,12 @@ class IncrementalState:
         self._xy_sum += x * y
         temp = lap.get("track_temp_mean", lap.get("track_temp"))
         if temp is not None and isfinite(float(temp)):
+            # The batch optimizer uses the CURRENT lap's track temperature
+            # (the Gold column `track_temp_mean`), not a session average, so
+            # the live path must report the same quantity.
+            self.track_temp_mean = float(temp)
             self._temp_sum += float(temp)
             self._temp_count += 1
-            self.track_temp_mean = self._temp_sum / self._temp_count
         if lap.get("cluster") is not None:
             self.cluster = int(lap["cluster"])
         return self.snapshot()

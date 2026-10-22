@@ -61,61 +61,82 @@ def _flag_pit_laps(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _track_evolution(df_all: pl.DataFrame) -> pl.DataFrame:
-    """TEI with rain wash-out (spec update).
+    """TEI with a causal rain wash-out.
 
-    Weekend fold (chronological, per spec):
-        R_prior(S_k) = [R_prior(S_{k-1}) + w_{k-1} V_{k-1} (0.5)^W_{k-1}]
-                       * (gamma_wash)^W_k
-    Lap level inside session k at lap t:
-        TEI(t) = [R_prior(S_k) + w_k * cum_session_laps(t)] * (0.6)^r_t
-    where r_t = 1 if any driver is on INTERMEDIATE/WET at lap number t
-    (per-lap rain proxy). Wet session flag W_s = wet-compound lap fraction
-    > 0.02 OR any rain recorded in the session (rain_flag).
+    The weekend fold stays chronological, but the wash-out is applied at the
+    lap where the rain is FIRST observed rather than to the whole session.
+    A session-level wet flag let rain on lap 20 change the rubber estimate
+    for lap 1 of the same session, i.e. future information leaking into the
+    earliest laps of the race.
+
+    Lap level inside session S_k at lap t:
+        prior(t)      = R_prior(S_k) * (gamma_wash if wet_by(t) else 1)
+        TEI_base(t)   = prior(t) + w_k * cum_session_laps(t)
+    where wet_by(t) means the session was already wet at or before lap t, and
+
+    TEI(t) = TEI_base(t) * (0.6)^r_t with r_t = 1 if any driver is on
+    INTERMEDIATE/WET at lap t (per-lap rain proxy).
+
+    The wash-out of the rubber carried in from earlier sessions therefore
+    starts at the first wet lap instead of at the start of the session, and
+    the rubber a wet session lays down is only WET_EFFICIENCY effective for
+    the sessions that follow it.
     """
     valid = df_all.filter(pl.col("laptime").is_not_null())
+    if "rain_flag" not in valid.columns:
+        valid = valid.with_columns(pl.lit(0).alias("rain_flag"))
 
-    # lap-number level: cumulative laps + any-wet-tyres indicator (r_t)
+    # lap-number level: driver count, wet-tyre indicator and rain per lap
     per_lapnum = (valid
                   .group_by(["season", "gp", "session", "lap"])
                   .agg(pl.len().alias("n_laps"),
                        pl.col("compound").is_in(WET_COMPOUNDS).any()
-                       .alias("is_wet_lap"))
+                       .alias("is_wet_lap"),
+                       (pl.col("rain_flag").max() > 0).alias("has_rain"))
                   .sort(["season", "gp", "session", "lap"]))
-    per_lapnum = per_lapnum.with_columns(
-        pl.col("n_laps").cum_sum().over(["season", "gp", "session"])
-        .alias("cum_session_laps"))
 
-    # session-level summaries: total laps, wet flag, weight, weekend order
-    sess = (valid
+    # session-level: first lap at which the session turned wet, plus weight
+    sess = (per_lapnum
             .group_by(["season", "gp", "session"])
-            .agg(pl.len().alias("V"),
-                 (pl.col("compound").is_in(WET_COMPOUNDS).mean() > 0.02)
-                 .alias("wet_by_compound"),
-                 (pl.col("rain_flag").max() > 0).alias("wet_by_rain")))
-    sess = sess.with_columns(
-        (pl.col("wet_by_compound") | pl.col("wet_by_rain"))
-        .alias("is_wet_session"))
-    sess = sess.with_columns(
-        pl.col("session").map_elements(
-            lambda s: SESS_WEIGHT.get(s, 1.0), return_dtype=pl.Float64)
-        .alias("sess_w"),
-        pl.col("session").map_elements(
-            lambda s: SESS_ORDER.get(s, 8), return_dtype=pl.Int32)
-        .alias("sess_ord"))
-    sess = sess.sort(["season", "gp", "sess_ord"])
+            .agg(pl.col("n_laps").sum().alias("V"),
+                 pl.col("lap").filter(pl.col("is_wet_lap") | pl.col("has_rain"))
+                 .min().alias("wet_from_lap")))
 
-    # chronological fold over weekend sessions (spec Step 2)
+    per_lapnum = per_lapnum.join(
+        sess.select(["season", "gp", "session", "wet_from_lap"]),
+        on=["season", "gp", "session"], how="left")
+    per_lapnum = per_lapnum.with_columns(
+        (pl.col("wet_from_lap").is_not_null()
+         & (pl.col("lap") >= pl.col("wet_from_lap"))).alias("wet_by"))
+    per_lapnum = per_lapnum.with_columns([
+        pl.col("n_laps").cum_sum().over(["season", "gp", "session"])
+        .alias("cum_session_laps"),
+    ])
+
+    sess = (sess
+            .with_columns([
+                pl.col("session").map_elements(
+                    lambda s: SESS_WEIGHT.get(s, 1.0), return_dtype=pl.Float64)
+                .alias("sess_w"),
+                pl.col("session").map_elements(
+                    lambda s: SESS_ORDER.get(s, 8), return_dtype=pl.Int32)
+                .alias("sess_ord")])
+            .sort(["season", "gp", "sess_ord"]))
+
+    # chronological fold over weekend sessions (spec Step 2). The wash-out of
+    # the rubber carried in from earlier sessions happens INSIDE the wet
+    # session, from its first wet lap onwards; the rubber a wet session lays
+    # down is only WET_EFFICIENCY effective for the sessions that follow.
     r_prior_map = {}
     state = {}
     for row in sess.to_dicts():
         wk = (row["season"], row["gp"])
         if wk not in state:
             state[wk] = 0.0
-        if row["is_wet_session"]:
-            state[wk] *= GAMMA_WASH
         r_prior_map[(row["season"], row["gp"], row["session"])] = state[wk]
-        eff = WET_EFFICIENCY if row["is_wet_session"] else 1.0
-        state[wk] += row["sess_w"] * row["V"] * eff
+        washed = GAMMA_WASH if row["wet_from_lap"] is not None else 1.0
+        eff = WET_EFFICIENCY if row["wet_from_lap"] is not None else 1.0
+        state[wk] = state[wk] * washed + row["sess_w"] * row["V"] * eff
 
     prior = pl.DataFrame({
         "season": [k[0] for k in r_prior_map],
@@ -127,6 +148,12 @@ def _track_evolution(df_all: pl.DataFrame) -> pl.DataFrame:
            .join(prior, on=["season", "gp", "session"], how="left")
            .join(sess.select(["season", "gp", "session", "sess_w"]),
                  on=["season", "gp", "session"], how="left"))
+    # The rubber carried in from earlier sessions is washed from the session's
+    # first wet lap onwards, so `r_prior_rubber` is lap-resolved.
+    tei = tei.with_columns(
+        (pl.col("r_prior_rubber")
+         * pl.when(pl.col("wet_by")).then(GAMMA_WASH).otherwise(1.0)
+         ).alias("r_prior_rubber"))
     tei = tei.with_columns(
         (pl.col("r_prior_rubber") + pl.col("sess_w")
          * pl.col("cum_session_laps")).alias("_tei_base"))

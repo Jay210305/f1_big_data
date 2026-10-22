@@ -1,0 +1,3 @@
+-r requirements.txt
+# CPU wheels suffice for the synthetic CI fixtures; CUDA is a local setup step.
+torch>=2.5

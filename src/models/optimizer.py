@@ -230,8 +230,16 @@ def _sample_cliff(rng, cliff_cfg, n):
 def _sample_beta(rng, mu, sigma, n):
     """Beta sampler with a physical cap: the raw slope distribution has
     traffic-locked outliers, so uncapped samples + the lower clip would
-    explode E[beta] far above the fitted median rate."""
-    lo, hi = 0.005, min(mu * 4.0 + 0.15, 1.0)
+    explode E[beta] far above the fitted median rate.
+
+    The upper bound is derived from the *non-negative* part of the fitted
+    mean. A negative fitted mean (wet compounds, where the rain term
+    dominates the slope) must not push the upper clip below the physical
+    lower bound: np.clip with lo > hi returns hi, which would silently
+    produce negative degradation rates.
+    """
+    lo = 0.005
+    hi = min(max(mu, 0.0) * 4.0 + 0.15, 1.0)
     return np.clip(rng.normal(mu, sigma, n), lo, hi)
 
 
@@ -274,6 +282,17 @@ def stint_time(base, pen, beta, L, cliff_rem, jump, slope):
     return L * (base + pen) + deg + cliff_cost
 
 
+def _elapsed_laps(state) -> int:
+    """Laps of the current stint completed BEFORE the lap the car is on.
+
+    ``laps_into_stint`` counts the laps of the current stint that have been
+    run, including the lap the car is currently on. The empirical cliff
+    distribution is indexed from the start of the stint, so the number of
+    already-elapsed laps is one less.
+    """
+    return max(int(state.get("laps_into_stint", 0)) - 1, 0)
+
+
 def simulate(strategy, state, params, scen, n_sims, rng, sc_windows=None):
     """Returns (n_sims,) total seconds for the remaining race."""
     totals = np.zeros(n_sims)
@@ -297,7 +316,7 @@ def simulate(strategy, state, params, scen, n_sims, rng, sc_windows=None):
                 comp, {"censor_prob": 1.0, "quantiles": [20.0]})
             beta = _sample_beta(rng, beta_mu, sigma, n_sims)
             cliff_rem = _sample_cliff(rng, cliff_cfg, n_sims) \
-                - state["laps_into_stint"]
+                - _elapsed_laps(state)
             if state["in_cliff_now"]:
                 cliff_rem = np.minimum(cliff_rem, -1.0)
         else:
@@ -316,8 +335,15 @@ def simulate(strategy, state, params, scen, n_sims, rng, sc_windows=None):
             cliff_rem = _sample_cliff(rng, cliff_cfg, n_sims)
         beta = beta * scen["beta_mult"]
         totals += stint_time(base, scen_pen, beta, L, cliff_rem, jump, slope)
-    stop_laps = [e for c, e, cur in strategy
-                 if not cur and e > state["cur_lap"]]
+    # The pit happens at the END of every stint that is followed by another
+    # stint, so a strategy with k stints has exactly k-1 stops. The previous
+    # implementation took the end lap of the *following* stint, which
+    # (a) applied the SC/VSC pit-loss discount to the wrong lap and
+    # (b) charged the race-finish lap as a pit stop.
+    # NOTE: no lap filter here. The first pit can legitimately fall on the
+    # current lap (the decision is taken at the pit), and dropping it would
+    # charge the executed strategy one pit loss fewer than the candidate.
+    stop_laps = [strategy[i][1] for i in range(len(strategy) - 1)]
     if stop_laps and sc_windows is not None:
         under_sc = _stop_is_under_sc(stop_laps, *sc_windows)
         pit_loss_sc = float(scen.get("pit_loss_sc", PIT_LOSS_SC))
@@ -328,24 +354,61 @@ def simulate(strategy, state, params, scen, n_sims, rng, sc_windows=None):
     return totals
 
 
+def _allowed_compounds(state) -> list[str]:
+    """Compound pool the strategy may use, given the weather context.
+
+    A dry race cannot be run on wet tyres, so the dry pool is restricted to
+    the three slicks. A wet race may use wet tyres and, as the track dries
+    out, slicks.
+    """
+    if state.get("wet"):
+        return list(WET_COMPOUNDS) + list(DRY)
+    return list(DRY)
+
+
 def enumerate_strategies(state):
-    """Strategies as [(compound, end_lap, is_current), ...]."""
+    """Strategies as [(compound, end_lap, is_current), ...].
+
+    Two physical rules constrain the candidate set:
+
+    1. *Weather feasibility* — in a dry context only dry compounds may
+       appear; wet tyres would be unusable on a dry track.
+    2. *The F1 two-compound rule* — a dry race must be run on at least two
+       different compounds, so a candidate that would finish the race on a
+       single compound is rejected. The compounds already used earlier in the
+       race count towards that total.
+    """
     cur, n = state["cur_lap"], state["n_laps"]
     used = set(state["compounds_used"])
-    out = [[(state["compound"], n, True)]]
+    pool = _allowed_compounds(state)
+    dry_context = not state.get("wet")
+
+    def _legal(compounds) -> bool:
+        return not dry_context or len(used | set(compounds)) >= 2
+
+    out = []
     for p1 in range(cur + 2, n - 2, 2):
-        for c1 in COMPOUNDS:
-            if len(used | {c1}) < 2 and n - p1 > 3:
+        for c1 in pool:
+            if not _legal([c1]):
                 continue
             out.append([(state["compound"], p1, True), (c1, n, False)])
     for p1 in range(cur + 3, n - 10, 4):
         for p2 in range(p1 + 6, n - 2, 4):
-            for c1 in COMPOUNDS:
-                for c2 in COMPOUNDS:
-                    if len(used | {c1, c2}) < 2:
+            for c1 in pool:
+                for c2 in pool:
+                    if not _legal([c1, c2]):
                         continue
                     out.append([(state["compound"], p1, True),
                                 (c1, p2, False), (c2, n, False)])
+    # A zero-stop run is only legal when the compounds used so far already
+    # satisfy the two-compound rule.
+    if _legal([]):
+        out.append([(state["compound"], n, True)])
+    if not out:
+        # Degenerate case: the remaining distance is too short for any legal
+        # two-compound plan, so running the current compound to the flag is
+        # the only physically possible option.
+        out.append([(state["compound"], n, True)])
     if len(out) > 400:
         idx = np.linspace(0, len(out) - 1, 400).astype(int)
         out = [out[i] for i in idx]
@@ -497,6 +560,7 @@ def get_prerace_state(season, gp, driver, starting_compound):
         "base_pace": pace_rows[starting_compound], "in_cliff_now": False,
         "temp": temp, "cluster": cluster,
         "compounds_used": [starting_compound],
+        "wet": starting_compound in WET_COMPOUNDS,
         "pace_source": f"{session} longest stints (median laptime; "
                    f"{', '.join(pace_sources)})",
         "practice_pace": pace_rows,
@@ -614,7 +678,35 @@ def run_monitor(df_driver, meta, rul_m, cliff_x, cliff_l, thr, label="",
 # ---------------------------------------------------------------------------
 # Demo: real race state -> optimization + monitor backtest
 # ---------------------------------------------------------------------------
-def get_state(df, season, gp, session, driver, lap, lapf=None):
+def known_compounds(compounds):
+    """The compounds that are actually known, sorted.
+
+    A lap history read from MongoDB can carry a canonical BSON null for a
+    compound the source could not resolve. An unknown tyre is not part of the
+    compound set: it is dropped instead of reaching the sort that compares
+    the compounds, which would fail on None.
+    """
+    return sorted(c for c in compounds if c is not None)
+
+
+def get_state(df, season, gp, session, driver, lap, lapf=None, repo=None):
+    if repo is not None:
+        from pymongo.errors import ConnectionFailure
+        try:
+            history = repo.lap_history(str(season), gp, session, driver)
+            if not history:
+                raise ValueError(f"no MongoDB history for {season} {gp} {session} {driver}; run ingest")
+            length = repo.session_lap_count(str(season), gp, session)
+            session_frame = pl.DataFrame([dict(season=str(season), gp=gp,
+                                               session=session, lap=length)])
+            return get_state(pl.DataFrame(history, infer_schema_length=None), str(season),
+                             gp, session, driver, lap, lapf=session_frame)
+        except ConnectionFailure as exc:
+            print(f"[source] MongoDB unavailable ({type(exc).__name__}); using parquet")
+            if df is None:
+                from .export_labeled import export_labeled
+                df = pl.read_parquet(export_labeled())
+                lapf = pl.read_parquet(ROOT / "data/gold/lap_features.parquet")
     sub = df.filter((pl.col("season") == season) & (pl.col("gp") == gp)
                     & (pl.col("session") == session)
                     & (pl.col("driver") == driver))
@@ -631,15 +723,23 @@ def get_state(df, season, gp, session, driver, lap, lapf=None):
         n_laps = int(df.filter((pl.col("season") == season)
                                & (pl.col("gp") == gp)
                                & (pl.col("session") == session))["lap"].max())
-    used = sorted(sub.filter(pl.col("lap") <= lap)["compound"]
-                  .unique().to_list())
+    used = known_compounds(sub.filter(pl.col("lap") <= lap)["compound"].unique().to_list())
     rows = (sub.filter(pl.col("lap") == lap).sort("life").to_dicts())
     if not rows:
         raise SystemExit(f"lap {lap} not found for {driver} in {gp} {session}")
     row = rows[-1]
     stint = row["stint"]
     sst = sub.filter(pl.col("stint") == stint).sort("life")
-    pos = int((sst["lap"] <= lap).sum()) - 1
+    # laps_into_stint counts the laps of the current stint that have been
+    # run, INCLUDING the lap the car is currently on. The zero-based index
+    # of the current lap inside its stint is that count minus one.
+    pos = int((sst["lap"] <= lap).sum())
+    # weather context: rain already observed in this session, or a wet tyre
+    # currently in use. Used to restrict the candidate compound pool.
+    so_far = sub.filter(pl.col("lap") <= lap)
+    rain = (float(so_far["rain_flag"].max() or 0.0)
+            if "rain_flag" in so_far.columns else 0.0)
+    wet = bool(rain > 0) or str(row["compound"] or "") in WET_COMPOUNDS
     return {
         "season": season, "gp": gp, "session": session, "driver": driver,
         "cur_lap": int(lap), "n_laps": n_laps, "compound": row["compound"],
@@ -649,6 +749,7 @@ def get_state(df, season, gp, session, driver, lap, lapf=None):
         "temp": float(row["track_temp_mean"] or 36.0),
         "cluster": int(row["cluster"]),
         "compounds_used": used,
+        "wet": wet,
     }
 
 
@@ -659,6 +760,9 @@ def main():
     ap.add_argument("--driver", default="VER")
     ap.add_argument("--season", default="2025")
     ap.add_argument("--lap", type=int, default=12)
+    ap.add_argument("--source", choices=["parquet", "mongo"], default="parquet")
+    ap.add_argument("--mongo-uri", default=None)
+    ap.add_argument("--mongo-db", default=None)
     ap.add_argument("--pre-race", action="store_true",
                     help="seed lap-zero state from the driver's practice data")
     ap.add_argument("--starting-compound", choices=COMPOUNDS, default="MEDIUM")
@@ -685,16 +789,26 @@ def main():
         meta = rul_m = cliff_x = cliff_l = thr = weights = lstm_m = None
     else:
         meta, rul_m, cliff_x, cliff_l, thr, weights, lstm_m = load_phase4()
-        print("[opt] building labeled frame...")
-        df = build_labeled_frame()
-        emb = pl.read_parquet(ROOT / "data" / "gold" / "driver_embeddings.parquet")
-        emb = emb.with_columns(pl.col("season").cast(pl.Utf8))
-        df = df.join(emb.select(["season", "driver", "cluster"]),
-                     on=["season", "driver"], how="left")
-        df = df.with_columns(pl.col("cluster").fill_null(-1).cast(pl.Int32))
-        state = get_state(df, args.season, args.gp, "Race", args.driver, args.lap,
-                          lapf=pl.read_parquet(ROOT / "data" / "gold"
-                                               / "lap_features.parquet"))
+        repo = None
+        if args.source == "mongo":
+            from pymongo.errors import ConnectionFailure
+            from src.nosql.connection import get_database
+            from src.nosql.repository import Repository
+            try:
+                repo = Repository(get_database(args.mongo_uri, args.mongo_db))
+                df = pl.DataFrame(repo.lap_history(args.season, args.gp, "Race", args.driver),
+                                  infer_schema_length=None)
+                state = get_state(None, args.season, args.gp, "Race", args.driver, args.lap, repo=repo)
+                print("[source] mongo (labeled lap history + unfiltered session length)")
+            except ConnectionFailure as exc:
+                print(f"[source] MongoDB unavailable ({type(exc).__name__}); using parquet")
+                repo = None
+        if repo is None:
+            from .export_labeled import export_labeled
+            df = pl.read_parquet(export_labeled())
+            state = get_state(df, args.season, args.gp, "Race", args.driver, args.lap,
+                              lapf=pl.read_parquet(ROOT / "data/gold/lap_features.parquet"))
+            print("[source] parquet")
     print(f"\n[state] {args.season} {args.gp} Race | {args.driver} @ lap "
           f"{state['cur_lap']}/{state['n_laps']}")
     print(f"        stint {state['stint']} on {state['compound']} "
