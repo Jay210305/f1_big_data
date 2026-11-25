@@ -37,8 +37,9 @@ scope is one computer and one MongoDB node.
   saved-model equality is false; compare wet MR/Mongo/Polars on shared inputs.
 - Full trace verification allows zero emissions after filtering. Distinct key
   count does not equal the number of reducers. Sampled traces are illustrative.
-- Existing backtest summary: 313 decisions, 21 races, `sc_hazard`, 78.9% wins and
-  +14.4 s median. Stored history: 200. No attempt is made to invent the other 113.
+- Documented post-calibration backtest: 313 decisions, 21 races, `sc_hazard`,
+  77.6% simulated wins and +18.0 s median (PROJECT_OVERVIEW §17.4). The current
+  writer retains the full decision history for ingestion.
 - Replication, sharding and multi-host throughput/failover are discussion only.
   Index bytes, collection bytes, latency and client-memory observations apply
   to the measured local experiment.

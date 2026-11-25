@@ -6,14 +6,14 @@ from ..types import JobSpec
 
 KEYS = ["season", "gp", "session", "driver", "stint"]
 COMPOUNDS = ["SOFT", "MEDIUM", "HARD", "INTERMEDIATE", "WET"]
+LAP_COLUMNS = ("life", "lap", "fuel_corr", "compound", "is_sc_lap", "cluster",
+               "stint_best_pace", "dirty_air_frac", "track_temp_mean", "t_end_life")
 
 
 def map_lap(record, ctx):
     if record.get("compound") not in COMPOUNDS:
         return []
-    columns = ("life", "lap", "fuel_corr", "compound", "is_sc_lap", "cluster",
-               "stint_best_pace", "dirty_air_frac", "track_temp_mean", "t_end_life")
-    return [("|".join(str(record[k]) for k in KEYS), {k: record.get(k) for k in columns})]
+    return [("|".join(str(record[k]) for k in KEYS), {k: record.get(k) for k in LAP_COLUMNS})]
 
 
 def slope(rows, x="life", y="fuel_corr"):

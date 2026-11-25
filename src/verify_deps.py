@@ -58,7 +58,7 @@ def main() -> None:
     for name, installed, spec, status in rows:
         print(f"  {name:16s} {installed:16s} {spec:20s} {status}")
 
-    missing = [r for r in rows if r[3] == "MISSING"]
+    missing = [r for r in rows if r[1] == "MISSING"]
     mismatch = [r for r in rows if r[3] == "MISMATCH"]
     print("-" * 78)
     print(f"  {len(rows)} requirements | {len(missing)} missing | "

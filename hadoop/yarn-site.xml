@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<configuration>
+  <property><name>yarn.resourcemanager.hostname</name><value>resourcemanager</value></property>
+  <property><name>yarn.nodemanager.aux-services</name><value>mapreduce_shuffle</value></property>
+  <property><name>yarn.nodemanager.resource.memory-mb</name><value>2048</value></property>
+  <property><name>yarn.scheduler.minimum-allocation-mb</name><value>512</value></property>
+  <property><name>yarn.scheduler.maximum-allocation-mb</name><value>2048</value></property>
+  <property><name>yarn.nodemanager.vmem-check-enabled</name><value>false</value></property>
+</configuration>

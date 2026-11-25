@@ -41,8 +41,8 @@ multi-node deployment. The following outline is a presentation script, not a PPT
 10. **Limits and conclusion.** Dry saved-model parity passes; saved wet entries
     are absent. Raw Gold slope (mean difference 3.7098, max 363.0841) and driver
     style use different populations. One node does not prove horizontal scaling.
-    The 313-decision backtest summary has only 200 stored history rows; its
-    78.9% win rate is simulator-based, not a causal real-world guarantee.
+    The calibrated backtest covers 313 decisions and reports 77.6% simulated
+    wins (PROJECT_OVERVIEW §17.4).
 
 ## Reproducible demonstration
 
