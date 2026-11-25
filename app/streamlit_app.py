@@ -11,29 +11,45 @@ from pathlib import Path
 import streamlit as st
 
 from src.models import optimizer
+from src.live.demo import DECISION_LAP
+from src.live.replay import BAHRAIN_GP, bahrain_frame, reference_params, validate_laps
 from src.live.state_updater import new_state
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_rows(upload):
+def _load_rows(upload, n_laps):
     if upload is None:
         return []
-    payload = json.loads(upload.getvalue().decode("utf-8"))
-    return payload if isinstance(payload, list) else payload.get("laps", [])
+    try:
+        payload = json.loads(upload.getvalue())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("El archivo no contiene JSON válido.") from error
+    return validate_laps(payload, n_laps)
 
 
 def _render_live():
     with st.sidebar:
-        season = st.text_input("Temporada", "2025")
-        gp = st.text_input("Gran Premio", "Sesión en vivo")
-        driver = st.text_input("Piloto", "VER")
-        n_laps = st.number_input("Vueltas de carrera", min_value=1, value=57)
-        compound = st.selectbox("Compuesto inicial",
-                                ["SOFT", "MEDIUM", "HARD", "INTERMEDIATE", "WET"],
-                                index=1)
-        upload = st.file_uploader("Secuencia de vueltas JSON", type="json")
-    rows = _load_rows(upload)
+        demo = st.radio("Fuente", ["Bahréin 2025 · VER", "Archivo JSON"]) == "Bahréin 2025 · VER"
+        if demo:
+            season, gp, driver, n_laps, compound = "2025", BAHRAIN_GP, "VER", 57, "SOFT"
+            through_lap = st.slider("Reproducir hasta la vuelta", 1, n_laps, DECISION_LAP)
+        else:
+            season = st.text_input("Temporada", "2025")
+            gp = st.text_input("Gran Premio", "Sesión en vivo")
+            driver = st.text_input("Piloto", "VER")
+            n_laps = st.number_input("Vueltas de carrera", min_value=1, value=57)
+            compound = st.selectbox("Compuesto inicial", optimizer.COMPOUNDS, index=1)
+            upload = st.file_uploader("Secuencia de vueltas JSON", type="json")
+    if demo:
+        rows = bahrain_frame().head(through_lap).to_dicts()
+        st.caption("Vueltas registradas por TracingInsights. Estrategias simuladas con parámetros secos de referencia.")
+    else:
+        try:
+            rows = _load_rows(upload, n_laps)
+        except ValueError as error:
+            st.error(str(error))
+            return
     state = new_state(season, gp, driver, n_laps, compound)
     snapshots = []
     for row in rows:
@@ -52,8 +68,16 @@ def _render_live():
     st.metric("Temperatura de pista", f"{current['track_temp_mean']:.1f} C")
     st.metric("Compuestos utilizados", ", ".join(current["compounds_used"]))
     model_path = ROOT / "data" / "models" / "degradation_model.json"
-    if model_path.exists():
-        params = json.loads(model_path.read_text(encoding="utf-8"))
+    if current["cur_lap"] == current["n_laps"]:
+        st.info("Carrera finalizada.")
+    elif demo or model_path.exists():
+        try:
+            params = reference_params() if demo else json.loads(model_path.read_text(encoding="utf-8"))
+            if not isinstance(params, dict):
+                raise ValueError
+        except (OSError, ValueError):
+            st.error("No se pudo leer el modelo de degradación.")
+            return
         scenarios = optimizer.load_scenarios(params)
         recommendations = optimizer.optimize(state.as_optimizer_state(),
                                              params, 150, scenarios)
@@ -105,7 +129,7 @@ def _render_history():
 def main():
     st.set_page_config(page_title="Estrategia F1", layout="wide")
     st.title("Estrategia F1")
-    live, history = st.tabs(["Vivo", "Historial MongoDB"])
+    live, history = st.tabs(["Reproducción", "Historial MongoDB"])
     with live:
         _render_live()
     with history:

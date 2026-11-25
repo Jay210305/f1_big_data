@@ -14,8 +14,22 @@ python -m pytest
 python -m src.run_all
 ```
 
-The ignored `2021/`–`2025/` raw datasets and `data/` artifacts must be supplied
-locally; tests use small synthetic fixtures and do not need the lakehouse.
+The full training run requires the ignored `2021/`–`2025/` raw datasets and
+locally generated `data/` artifacts. The Bahrain replay works without the
+full lakehouse.
+
+## Demo con datos reales
+
+La muestra incluye las 57 vueltas de Verstappen en Bahréin 2025.
+
+```bash
+python -m src.live.demo
+python -m streamlit run app/streamlit_app.py
+```
+
+El tablero abre la reproducción en la vuelta 12. El primer comando guarda el
+Parquet y la recomendación en `data/demo/`. La [guía de reproducción](RUNBOOK.md)
+incluye la comprobación de MongoDB y Hadoop.
 
 ## Documentation
 
@@ -33,10 +47,23 @@ locally; tests use small synthetic fixtures and do not need the lakehouse.
 ## Verification
 
 ```powershell
-python -m pytest -q                              # 157 passed
+python -m pytest -q
 python -m src.models.calibrate                   # simulator vs the realized lap times
 python -m src.mapreduce.evidence --silver --mongo # three-engine parity
 ```
 
 See [PLAN3.md](PLAN3.md), [the runtime guide](src/mapreduce/README.md), and
 [the Mongo guide](src/nosql/README.md) for the Phase 9 commands and evidence.
+
+## Hadoop Streaming
+
+HDFS and YARN can run the Python `stint_stats` job as an optional Hadoop
+backend. Its CLI checks the results against the local runner and Polars.
+
+```bash
+docker compose -f compose.hadoop.yaml up --build -d --wait
+python -m src.live.demo
+python -m src.hadoop.cli --input data/demo/bahrain_2025_ver.parquet
+```
+
+See the [Hadoop guide](hadoop/README.md) for real data, outputs, and shutdown.

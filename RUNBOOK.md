@@ -7,6 +7,65 @@ Pit-window optimizer → backtest.
 All commands run from the repo root with the venv active
 (`.\.venv\Scripts\Activate.ps1`).
 
+## Demo con datos reales: Bahréin 2025
+
+Usa Python 3.12 para reproducir el entorno de CI. En Linux, desde la raíz:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m src.live.demo
+python -m streamlit run app/streamlit_app.py
+```
+
+El tablero reproduce las 57 vueltas registradas de Max Verstappen desde la
+vuelta que selecciones. Inicia en la 12, con un intervalo p5–p95 de los tiempos
+simulados. Usa los coeficientes secos publicados en el informe para ilustrar
+el motor. La muestra cubre un piloto y no reentrena ni valida el modelo.
+También puedes cargar un JSON con una lista de registros `lap`, `laptime` y
+`compound`, y con `stint` y `track_temp_mean` opcionales.
+
+Para verificar MongoDB, ejecuta con un servidor accesible. El comando escribe y
+vuelve a consultar la decisión simulada en la base separada `f1_tyre_demo`.
+
+```bash
+python -m src.nosql.cli health
+python -m src.live.demo --mongo
+MONGO_DB=f1_tyre_demo python -m streamlit run app/streamlit_app.py
+```
+
+Para verificar Hadoop, desde otra terminal con el entorno activado:
+
+```bash
+docker compose -f compose.hadoop.yaml up --build -d --wait
+python -m src.live.demo
+python -m src.hadoop.cli --input data/demo/bahrain_2025_ver.parquet
+```
+
+La entrada debe tener 57 vueltas y la salida tres stints. Conserva el
+`parity.json` de la ejecución junto al ID del trabajo en YARN.
+La [procedencia y transformaciones de la muestra](examples/README.md) detallan
+las columnas originales.
+
+## Datos para reentrenar
+
+Los archivos completos se descargan desde el
+[archivo de TracingInsights](https://tracinginsights.com/data/) y se colocan
+en carpetas `2021/` a `2025/` de la raíz. Con Git y Bash:
+
+```bash
+for season in 2021 2022 2023 2024 2025; do
+  if [[ ! -e "$season" ]]; then
+    git clone --depth 1 "https://github.com/TracingInsights/$season.git" "$season" || break
+  fi
+done
+```
+
+Confirma que estén las cinco temporadas antes de ejecutar el pipeline completo
+y registra el commit de cada una para repetir la misma extracción. El
+modelo RUL entrena con 2021–2023, valida con 2024 y prueba con 2025.
+
 ## Quick path (skip-if-cached)
 
 ```powershell
@@ -97,8 +156,9 @@ The `phase7_backtest.json` summary evaluates **313** decisions and the writer
 now retains the full history, so MongoDB imports the same **313** documents as
 the summary. A full ingest also prunes documents the source no longer
 produces, so a re-ingest after a backtest change cannot leave stale rows
-behind. The summary's current scenario is `sc_hazard`: **77.3%** wins,
-median **+13.8 s**, 1.51 recommended stops against 1.66 actually run.
+behind. The summary's current scenario is `sc_hazard`: **77.6%** simulated wins,
+median **+18.0 s**, 1.73 recommended stops against 1.66 actually run.
+These are the documented post-calibration results in PROJECT_OVERVIEW §17.4.
 
 `backtest.py` has no `--source` flag: the backtest always reads the lakehouse.
 Only `optimizer.py` can be pointed at MongoDB (`--source mongo`). The

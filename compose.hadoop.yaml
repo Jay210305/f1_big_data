@@ -1,0 +1,61 @@
+name: f1-hadoop
+
+x-hadoop: &hadoop
+  image: f1-hadoop:3.5.0
+  build: ./hadoop
+  entrypoint: []
+  init: true
+  environment:
+    HADOOP_MAPRED_HOME: /opt/hadoop
+
+services:
+  namenode:
+    <<: *hadoop
+    hostname: namenode
+    command:
+      - bash
+      - -ec
+      - |
+        if [ ! -f /var/lib/hadoop/name/current/VERSION ]; then
+          hdfs namenode -format -nonInteractive
+        fi
+        exec hdfs namenode
+    ports:
+      - "127.0.0.1:9870:9870"
+    volumes:
+      - namenode:/var/lib/hadoop/name
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -safemode get | grep -q 'Safe mode is OFF' && hdfs dfsadmin -report -live | grep -Eq 'Live datanodes \\([1-9][0-9]*\\)'"]
+      interval: 10s
+      timeout: 15s
+      retries: 18
+
+  datanode:
+    <<: *hadoop
+    hostname: datanode
+    command: ["hdfs", "datanode"]
+    depends_on: [namenode]
+    volumes:
+      - datanode:/var/lib/hadoop/data
+
+  resourcemanager:
+    <<: *hadoop
+    hostname: resourcemanager
+    command: ["yarn", "resourcemanager"]
+    ports:
+      - "127.0.0.1:8088:8088"
+    healthcheck:
+      test: ["CMD-SHELL", "yarn node -list -states RUNNING | grep -Eq 'Total Nodes:[[:space:]]*[1-9]'"]
+      interval: 10s
+      timeout: 15s
+      retries: 18
+
+  nodemanager:
+    <<: *hadoop
+    hostname: nodemanager
+    command: ["yarn", "nodemanager"]
+    depends_on: [resourcemanager]
+
+volumes:
+  namenode:
+  datanode:

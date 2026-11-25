@@ -37,5 +37,35 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v
 
+      - name: Verify Bahrain replay and MongoDB history
+        run: python -m src.live.demo --mongo
+
       - name: Byte-compile all sources
         run: python -m compileall -q src
+
+  hadoop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install replay and Hadoop client dependencies
+        run: python -m pip install numpy polars pyarrow duckdb
+
+      - name: Run Bahrain stint statistics on HDFS and YARN
+        run: |
+          python -m src.live.demo
+          docker compose -f compose.hadoop.yaml up --build -d --wait
+          python -m src.hadoop.cli --input data/demo/bahrain_2025_ver.parquet
+
+      - name: Report Hadoop service logs on failure
+        if: failure()
+        run: docker compose -f compose.hadoop.yaml logs --no-color
+
+      - name: Stop Hadoop services
+        if: always()
+        run: docker compose -f compose.hadoop.yaml down

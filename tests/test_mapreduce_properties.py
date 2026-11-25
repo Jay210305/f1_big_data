@@ -306,7 +306,10 @@ def test_seeded_telemetry_sufficient_statistics_and_null_parity(monkeypatch):
         rng.shuffle(parts)
         actual = lap.reduce_lap("2099|Audit|Race|TST|1", parts)[0][1]
         expected = frame.select(_silver_exprs(frame.columns, meta)).row(0, named=True)
-        assert actual == pytest.approx(expected, rel=1e-10, abs=1e-10), f"case {case}"
+        assert actual.keys() == expected.keys(), f"case {case}: different output fields"
+        for field, value in expected.items():
+            target = pytest.approx(value, rel=1e-10, abs=1e-10) if isinstance(value, float) else value
+            assert actual[field] == target, f"case {case}, field {field}"
 
 
 def test_seeded_stint_estimator_nulls_safety_car_and_rollup_match_polars():
